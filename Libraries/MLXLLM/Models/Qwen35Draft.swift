@@ -265,7 +265,8 @@ extension Qwen35MTP {
     /// draft proposal/acceptance counts.
     public static func generate(
         target: Qwen35Model, drafter: Qwen35DraftModel,
-        promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>
+        promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>,
+        onTokens: (([Int]) -> Bool)? = nil
     ) -> Qwen35MTPResult {
         let targetCache = target.newCache(parameters: nil)
 
@@ -283,8 +284,10 @@ extension Qwen35MTP {
 
         var proposed = 0
         var accepted = 0
+        // Stream the first bonus token; `onTokens` returning false requests cancellation.
+        var cancelled = (onTokens?([bonus]) == false)
 
-        while output.count < maxTokens && !eosTokens.contains(bonus) {
+        while !cancelled && output.count < maxTokens && !eosTokens.contains(bonus) {
             let draftArr = drafter.draftBlock()  // [1, blockSize-1]
             let draftTokens = draftArr.asArray(Int32.self).map { Int($0) }
             proposed += draftTokens.count
@@ -303,6 +306,8 @@ extension Qwen35MTP {
                 draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
             accepted += acc
             output.append(contentsOf: newToks)
+            // Stream this round's committed tokens (accepted drafts + the correction).
+            if onTokens?(newToks) == false { cancelled = true }
 
             // Target-cache invariant: at round start the current `bonus` is NOT in the cache;
             // the verify forward added [bonus, drafts]. Keep exactly [bonus] + accepted drafts
