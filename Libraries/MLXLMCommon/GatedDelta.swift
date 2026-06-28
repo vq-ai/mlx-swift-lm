@@ -11,9 +11,17 @@ import MLXNN
 
 // MARK: - Compute G
 
+// Fused via compile() to collapse the exp/exp/softplus/mul chain into one dispatch — Swift's
+// per-op MLX dispatch overhead dominates at decode (batch 1, seq 1), so consolidating the many
+// tiny elementwise ops here (x24 gated-delta layers/token) recovers that overhead. Matches the
+// Python @mx.compile on the same function.
+private let _computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { aLog, a, dtBias in
+        exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+    }
+
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay
+    _computeGatedDeltaG(aLog, a, dtBias)
 }
 
 // MARK: - Metal Kernel

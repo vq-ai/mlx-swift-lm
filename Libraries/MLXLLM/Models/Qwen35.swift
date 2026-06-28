@@ -160,6 +160,13 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+// Fused (compile): collapse `scale * rmsNorm(x)` into one dispatch. Swift's per-op MLX dispatch
+// overhead dominates at decode; consolidating these elementwise ops (x24 layers/token) recovers it.
+private let _rmsNormScaled: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { x, scale in
+        scale * MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: 1e-6)
+    }
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -264,12 +271,8 @@ final class Qwen35GatedDeltaNet: Module {
         var state = cache?[1]
         let dtype = q.dtype
         let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        let qNormed = _rmsNormScaled(q, MLXArray(pow(invScale, 2)).asType(dtype))
+        let kNormed = _rmsNormScaled(k, MLXArray(invScale).asType(dtype))
 
         var out: MLXArray
 
