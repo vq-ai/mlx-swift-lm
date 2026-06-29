@@ -134,7 +134,8 @@ public final class Qwen35DraftModel: Module {
     }
 
     /// Draft `blockSize - 1` tokens greedily, starting from the carried seed.
-    public func draftBlock() -> MLXArray {
+    public func draftBlock(blockSize: Int? = nil) -> MLXArray {
+        let effBlock = blockSize ?? self.blockSize
         roundAppended = 0
         guard let s = seedToken, let sh = seedHidden else {
             return MLXArray.zeros([1, 0], type: Int32.self)
@@ -144,7 +145,7 @@ public final class Qwen35DraftModel: Module {
         var tokens: [MLXArray] = [tok]
         seedToken = nil
         seedHidden = nil
-        while tokens.count < blockSize - 1 {
+        while tokens.count < effBlock - 1 {
             hPrev = forwardTokens(tok, hidden: hPrev)
             roundAppended += 1
             tok = argMax(lmHeadFn(hPrev), axis: -1).asType(.int32)  // [B, 1]
@@ -260,6 +261,9 @@ public struct Qwen35MTPResult {
     /// Full-model target forwards in the decode loop (verify + any re-forwards). With the
     /// per-step rollback this is ~one per round; the device win tracks this dropping.
     public var targetForwards: Int = 0
+    /// Number of speculation rounds (≈ target forwards). With `proposed`, gives the average
+    /// block size actually used (useful to see what Adaptive settled on).
+    public var rounds: Int = 0
 }
 
 extension Qwen35MTP {
@@ -269,6 +273,7 @@ extension Qwen35MTP {
     public static func generate(
         target: Qwen35Model, drafter: Qwen35DraftModel,
         promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>,
+        blockSize: Int? = nil,
         onTokens: (([Int]) -> Bool)? = nil
     ) -> Qwen35MTPResult {
         let targetCache = target.newCache(parameters: nil)
@@ -305,11 +310,27 @@ extension Qwen35MTP {
         var proposed = 0
         var accepted = 0
         var targetForwards = 0  // full-model forwards in the decode loop (verify + re-forwards)
+        var rounds = 0
+        var acceptLens: [Int] = []  // accepted drafts per round — drives the Adaptive block size
+        let adaptiveCeiling = 6     // Adaptive grows from the drafter's trained depth toward this
         // Stream the first bonus token; `onTokens` returning false requests cancellation.
         var cancelled = (onTokens?([bonus]) == false)
 
         while !cancelled && output.count < maxTokens && !eosTokens.contains(bonus) {
-            let draftArr = drafter.draftBlock()  // [1, blockSize-1]
+            // Effective block this round: a fixed `blockSize` if requested, else Adaptive —
+            // grow from the drafter's trained depth toward the ceiling only while recent rounds
+            // keep fully accepting the base depth (see `effectiveBlockSize`).
+            let remaining = maxTokens - output.count
+            let effBlock: Int
+            if let bs = blockSize, bs > 0 {
+                effBlock = min(bs, remaining)
+            } else {
+                effBlock = effectiveBlockSize(
+                    requestedBlock: adaptiveCeiling, configuredBlock: drafter.blockSize,
+                    acceptLens: acceptLens, remainingBudget: remaining)
+            }
+            rounds += 1
+            let draftArr = drafter.draftBlock(blockSize: effBlock)  // [1, effBlock-1]
             let draftTokens = draftArr.asArray(Int32.self).map { Int($0) }
             proposed += draftTokens.count
 
@@ -333,12 +354,23 @@ extension Qwen35MTP {
             let targetPreds = argMax(verifyLogits, axis: -1).asArray(Int32.self).map { Int($0) }
 
             let budget = maxTokens - output.count
-            let (acc, newToks) = speculativeWalk(
+            let (acc, newToksRaw) = speculativeWalk(
                 draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
             accepted += acc
+            acceptLens.append(acc)
+            // Stop at the first EOS among the committed tokens. EOS can be an accepted *draft*
+            // mid-block (not just the round's last token), so the `bonus`-only check misses it —
+            // which is why generation ran past `<|im_end|>`. Emit up to (not including) EOS.
+            var newToks = newToksRaw
+            var hitEOS = false
+            if let eosIdx = newToks.firstIndex(where: { eosTokens.contains($0) }) {
+                newToks = Array(newToks.prefix(eosIdx))
+                hitEOS = true
+            }
             output.append(contentsOf: newToks)
             // Stream this round's committed tokens (accepted drafts + the correction).
-            if onTokens?(newToks) == false { cancelled = true }
+            if !newToks.isEmpty, onTokens?(newToks) == false { cancelled = true }
+            if hitEOS { break }
 
             // Roll back the target cache to EXACTLY [bonus] + accepted drafts — the correction
             // is the NEXT bonus and stays out of the cache. On full acceptance the cache already
@@ -376,6 +408,6 @@ extension Qwen35MTP {
 
         return Qwen35MTPResult(
             tokens: Array(output.prefix(maxTokens)), proposed: proposed, accepted: accepted,
-            targetForwards: targetForwards)
+            targetForwards: targetForwards, rounds: rounds)
     }
 }

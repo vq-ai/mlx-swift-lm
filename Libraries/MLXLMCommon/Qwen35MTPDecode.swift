@@ -42,6 +42,26 @@ public enum Qwen35MTP {
         return (accepted, Array(newTokens.prefix(max(0, budget))))
     }
 
+    /// Adaptive MTP block size — ported from mlx-vlm `_effective_mtp_block_size`
+    /// (speculative/mtp.py). Grows from the drafter's configured (trained) depth toward
+    /// `requestedBlock` only when the base depth's drafts are fully accepted often enough
+    /// (≥65% of recent rounds); otherwise the extra autoregressive draft steps just pay for
+    /// tokens that won't be accepted, so it stays at the base. `acceptLens` is the per-round
+    /// accepted-draft history; `remainingBudget` caps the block to the tokens left to emit.
+    public static func effectiveBlockSize(
+        requestedBlock: Int, configuredBlock: Int, acceptLens: [Int], remainingBudget: Int
+    ) -> Int {
+        let blockTotal = min(requestedBlock, remainingBudget)
+        let configured = min(configuredBlock, blockTotal)
+        if blockTotal <= configured || configured <= 1 { return blockTotal }
+        if acceptLens.count < 8 { return configured }
+        let recent = acceptLens.suffix(32)
+        let configuredDraftCount = configured - 1
+        let hits = recent.filter { $0 >= configuredDraftCount }.count
+        let hitRate = Double(hits) / Double(recent.count)
+        return hitRate < 0.65 ? configured : blockTotal
+    }
+
     /// A full snapshot of the target's cache stack, taken before a verify forward so the
     /// cache can be restored exactly when speculation is (partly) rejected.
     ///

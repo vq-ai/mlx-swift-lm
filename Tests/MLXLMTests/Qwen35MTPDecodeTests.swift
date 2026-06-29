@@ -52,6 +52,55 @@ struct Qwen35MTPDecodeTests {
         #expect(r.newTokens == [5, 6])
     }
 
+    // MARK: - Adaptive block size (ported from _effective_mtp_block_size)
+
+    @Test func adaptiveStaysAtBaseWithShortHistory() {
+        // <8 rounds of history → don't grow yet, stay at the configured base.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3, acceptLens: [2, 2, 2], remainingBudget: 100)
+        #expect(bs == 3)
+    }
+
+    @Test func adaptiveGrowsWhenBaseFullyAccepted() {
+        // Recent rounds consistently accept the base draft-count (3-1=2) → grow to ceiling.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 2, count: 10), remainingBudget: 100)
+        #expect(bs == 6)
+    }
+
+    @Test func adaptiveStaysAtBaseWhenAcceptanceLow() {
+        // Base rarely fully accepted (<65%) → stay at base, don't waste draft steps.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 0, count: 10), remainingBudget: 100)
+        #expect(bs == 3)
+    }
+
+    @Test func adaptiveHitRateBoundary() {
+        // Exactly 65% (13/20) hits the base depth → grow; 60% (12/20) → stay.
+        let grow = [Int](repeating: 2, count: 13) + [Int](repeating: 0, count: 7)
+        #expect(Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3, acceptLens: grow, remainingBudget: 100) == 6)
+        let stay = [Int](repeating: 2, count: 12) + [Int](repeating: 0, count: 8)
+        #expect(Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3, acceptLens: stay, remainingBudget: 100) == 3)
+    }
+
+    @Test func adaptiveRespectsRemainingBudget() {
+        // Budget caps the block even when acceptance is high.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 2, count: 10), remainingBudget: 4)
+        #expect(bs == 4)
+    }
+
+    @Test func fixedBlockNoRoomToGrow() {
+        // requested == configured (a fixed size) → just return it (capped by budget).
+        #expect(Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 3, configuredBlock: 3, acceptLens: [], remainingBudget: 100) == 3)
+    }
+
     // MARK: - Stage 2: cache snapshot / restore (exact rollback on rejection)
 
     @Test func kvCacheSnapshotRestoreRoundTrip() {
