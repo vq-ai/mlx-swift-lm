@@ -257,6 +257,9 @@ public struct Qwen35MTPResult {
     public let tokens: [Int]
     public let proposed: Int
     public let accepted: Int
+    /// Full-model target forwards in the decode loop (verify + any re-forwards). With the
+    /// per-step rollback this is ~one per round; the device win tracks this dropping.
+    public var targetForwards: Int = 0
 }
 
 extension Qwen35MTP {
@@ -270,11 +273,28 @@ extension Qwen35MTP {
     ) -> Qwen35MTPResult {
         let targetCache = target.newCache(parameters: nil)
 
-        // Prefill the target over the prompt; first bonus = greedy argmax of the last position.
+        // Prefill the target over the prompt IN CHUNKS — a single full-prompt forward spikes
+        // activation memory and OOM-kills memory-tight devices (iPhone: ~400 MB headroom) on
+        // long RAG prompts. Collect the per-position hidden states (the drafter is prefilled
+        // from them) and keep the last chunk's logits for the first bonus token.
         let promptArr = MLXArray(promptTokens.map { Int32($0) }).reshaped([1, promptTokens.count])
-        let (promptHidden, promptLogits) = target.hiddenAndLogits(promptArr, cache: targetCache)
-        eval(promptHidden, promptLogits)
-        var bonus = argMax(promptLogits[0..., (promptTokens.count - 1)..., 0...], axis: -1)
+        let prefillStep = 256
+        var hiddenChunks: [MLXArray] = []
+        var lastChunkLogits = MLXArray.zeros([1, 1, 1])
+        var prefilled = 0
+        while prefilled < promptTokens.count {
+            let endIdx = min(prefilled + prefillStep, promptTokens.count)
+            let (h, l) = target.hiddenAndLogits(
+                promptArr[0..., prefilled ..< endIdx], cache: targetCache)
+            eval(h, l)
+            hiddenChunks.append(h)
+            lastChunkLogits = l
+            GPU.clearCache()
+            prefilled = endIdx
+        }
+        let promptHidden = concatenated(hiddenChunks, axis: 1)
+        eval(promptHidden)
+        var bonus = argMax(lastChunkLogits[0..., (lastChunkLogits.dim(1) - 1)..., 0...], axis: -1)
             .item(Int.self)
 
         var output: [Int] = [bonus]
@@ -284,6 +304,7 @@ extension Qwen35MTP {
 
         var proposed = 0
         var accepted = 0
+        var targetForwards = 0  // full-model forwards in the decode loop (verify + re-forwards)
         // Stream the first bonus token; `onTokens` returning false requests cancellation.
         var cancelled = (onTokens?([bonus]) == false)
 
@@ -296,9 +317,19 @@ extension Qwen35MTP {
             let verifyInput = [bonus] + draftTokens
             let verifyArr = MLXArray(verifyInput.map { Int32($0) })
                 .reshaped([1, verifyInput.count])
-            let snap = snapshotCaches(targetCache)
+            // Enable per-step capture on the gated-delta caches so a rejection rolls back
+            // without a re-forward. Read the true pre-verify offset from a full-attention
+            // cache (the gated-delta MambaCache does not track `offset` via `advance`).
+            let preVerifyOffset = targetCache.compactMap { ($0 as? KVCacheSimple)?.offset }.first ?? 0
+            for c in targetCache { (c as? MambaCache)?.captureVerify = true }
+            targetForwards += 1
             let (verifyHidden, verifyLogits) = target.hiddenAndLogits(verifyArr, cache: targetCache)
             eval(verifyHidden, verifyLogits)
+            // Materialize the per-step capture so it doesn't alias the (now-stale) verify graph.
+            for c in targetCache {
+                guard let m = c as? MambaCache, !m.capturedSSM.isEmpty else { continue }
+                eval(m.capturedConv + m.capturedSSM)
+            }
             let targetPreds = argMax(verifyLogits, axis: -1).asArray(Int32.self).map { Int($0) }
 
             let budget = maxTokens - output.count
@@ -309,16 +340,30 @@ extension Qwen35MTP {
             // Stream this round's committed tokens (accepted drafts + the correction).
             if onTokens?(newToks) == false { cancelled = true }
 
-            // Target-cache invariant: at round start the current `bonus` is NOT in the cache;
-            // the verify forward added [bonus, drafts]. Keep exactly [bonus] + accepted drafts
-            // (the correction is the NEXT bonus and must stay out). On full acceptance the cache
-            // already holds [bonus, all drafts] — nothing to do; otherwise roll back and re-commit.
+            // Roll back the target cache to EXACTLY [bonus] + accepted drafts — the correction
+            // is the NEXT bonus and stays out of the cache. On full acceptance the cache already
+            // holds [bonus, all drafts]; otherwise, with NO re-forward: full-attention caches
+            // `trim` to the accepted offset, gated-delta caches restore the captured per-step
+            // conv + SSM state at index `acc` (the state after [bonus]+accepted drafts).
             if acc < draftTokens.count {
-                restoreCaches(targetCache, to: snap)
-                let keep = [bonus] + newToks.dropLast()  // bonus + accepted drafts (drop correction)
-                let keepArr = MLXArray(keep.map { Int32($0) }).reshaped([1, keep.count])
-                let (keepHidden, _) = target.hiddenAndLogits(keepArr, cache: targetCache)
-                eval(keepHidden)
+                let keepOffset = preVerifyOffset + acc + 1
+                let drop = draftTokens.count - acc  // rejected drafts to drop from the verify block
+                for c in targetCache {
+                    if let mamba = c as? MambaCache {
+                        mamba[0] = mamba.capturedConv[acc]
+                        mamba[1] = mamba.capturedSSM[acc]
+                        (mamba as BaseKVCache).offset = keepOffset
+                    } else if let base = c as? BaseKVCache, base.isTrimmable {
+                        _ = base.trim(drop)
+                    }
+                }
+            }
+            // Clear capture state for the next round.
+            for c in targetCache {
+                guard let mamba = c as? MambaCache else { continue }
+                mamba.captureVerify = false
+                mamba.capturedConv = []
+                mamba.capturedSSM = []
             }
             // The drafter's own cache update only affects draft QUALITY (acceptance), never the
             // emitted tokens — the target verify above guarantees exactness regardless.
@@ -330,6 +375,7 @@ extension Qwen35MTP {
         }
 
         return Qwen35MTPResult(
-            tokens: Array(output.prefix(maxTokens)), proposed: proposed, accepted: accepted)
+            tokens: Array(output.prefix(maxTokens)), proposed: proposed, accepted: accepted,
+            targetForwards: targetForwards)
     }
 }

@@ -276,17 +276,46 @@ final class Qwen35GatedDeltaNet: Module {
 
         var out: MLXArray
 
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask
-        )
+        if cache?.captureVerify == true {
+            // Speculative verify. Compute the block output via the normal whole-block scan
+            // (bit-identical to baseline), and SEPARATELY capture the SSM + conv state after
+            // each token via a per-token scan (the recurrence is associative, so this matches
+            // exactly) so a rejection can roll back without a full-model re-forward. Conv state
+            // after token t is the (kernelSize-1)-wide window of `convInput` ending at t.
+            let initialState = state
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+            var ssmSteps: [MLXArray] = []
+            var convSteps: [MLXArray] = []
+            var running = initialState
+            for t in 0 ..< S {
+                let maskT = mask == nil ? nil : mask![0..., t ..< (t + 1)]
+                let (_, st) = gatedDeltaUpdate(
+                    q: qNormed[0..., t ..< (t + 1)], k: kNormed[0..., t ..< (t + 1)],
+                    v: v[0..., t ..< (t + 1)], a: a[0..., t ..< (t + 1)],
+                    b: b[0..., t ..< (t + 1)], aLog: aLog, dtBias: dtBias,
+                    state: running, mask: maskT)
+                running = st
+                ssmSteps.append(st)
+                convSteps.append(
+                    contiguous(convInput[0..., (t + 1) ..< (t + convKernelSize), 0...]))
+            }
+            cache?.capturedConv = convSteps
+            cache?.capturedSSM = ssmSteps
+        } else {
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+        }
 
         if let cache {
             cache[1] = state
