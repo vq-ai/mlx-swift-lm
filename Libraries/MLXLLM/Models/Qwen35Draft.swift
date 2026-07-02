@@ -274,6 +274,28 @@ extension Qwen35Model {
 
 // MARK: - Greedy speculative decode loop (Stage 5)
 
+/// Resumable decode state: the target's caches plus the EXACT token sequence they have
+/// consumed. A follow-up `generate` whose prompt EXTENDS `tokens` prefills only the suffix —
+/// the agentic loop re-sends the whole growing conversation every tool-call step, so resume
+/// turns each step's prefill from O(conversation) into O(new tool result). The hybrid's SSM
+/// states can't rewind, so resume is prefix-extension-only; any other prompt falls back to a
+/// fresh prefill (and re-primes this session). The drafter's cache rides along implicitly
+/// (same `Qwen35DraftModel` instance, not reset on resume) — pass the same drafter.
+public final class Qwen35MTPSession {
+    public internal(set) var caches: [KVCache] = []
+    public internal(set) var tokens: [Int] = []
+    /// Set when the caches stopped matching `tokens` exactly (EOS cut a verify block short).
+    public internal(set) var invalidated = true
+
+    public init() {}
+
+    /// True when `prompt` strictly extends the consumed tokens (resume = prefill the suffix).
+    func canResume(prompt: [Int]) -> Bool {
+        !invalidated && !tokens.isEmpty && prompt.count > tokens.count
+            && Array(prompt.prefix(tokens.count)) == tokens
+    }
+}
+
 public struct Qwen35MTPResult {
     public let tokens: [Int]
     public let proposed: Int
@@ -295,39 +317,53 @@ extension Qwen35MTP {
         promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>,
         blockSize: Int? = nil,
         prefillStep: Int = 256,
+        session: Qwen35MTPSession? = nil,
         onTokens: (([Int]) -> Bool)? = nil
     ) -> Qwen35MTPResult {
-        let targetCache = target.newCache(parameters: nil)
+        // Resume when the prompt strictly extends the session's consumed tokens: keep the
+        // caches (and the drafter's) and prefill only the suffix. Otherwise start fresh
+        // (and re-prime the session so the NEXT step can resume).
+        let resuming = session?.canResume(prompt: promptTokens) ?? false
+        let targetCache = resuming ? session!.caches : target.newCache(parameters: nil)
+        let suffixStart = resuming ? session!.tokens.count : 0
+        let suffixTokens = Array(promptTokens[suffixStart...])
 
-        // Prefill the target over the prompt IN CHUNKS — a single full-prompt forward spikes
-        // activation memory and OOM-kills memory-tight devices (iPhone: ~400 MB headroom) on
-        // long RAG prompts. The chunk size trades prefill speed (bigger amortizes weight reads)
-        // against peak activation memory — the default stays device-safe; hosts with headroom
-        // can raise it. Collect the per-position hidden states (the drafter is prefilled from
-        // them) and keep the last chunk's logits for the first bonus token.
-        let promptArr = MLXArray(promptTokens.map { Int32($0) }).reshaped([1, promptTokens.count])
+        // Prefill the target over the (suffix of the) prompt IN CHUNKS — a single full forward
+        // spikes activation memory and OOM-kills memory-tight devices (iPhone: ~400 MB
+        // headroom) on long RAG prompts. Collect the per-position hidden states (the drafter
+        // is prefilled from them).
+        let suffixArr = MLXArray(suffixTokens.map { Int32($0) }).reshaped([1, suffixTokens.count])
         var hiddenChunks: [MLXArray] = []
         var prefilled = 0
-        while prefilled < promptTokens.count {
-            let endIdx = min(prefilled + prefillStep, promptTokens.count)
+        while prefilled < suffixTokens.count {
+            let endIdx = min(prefilled + prefillStep, suffixTokens.count)
             // Hidden states only — the LM head runs ONCE below, on the final position. Computing
             // full-vocab logits for every prompt position wasted an LM-head matmul (~0.6 GFLOP
             // per position) plus a [chunk, vocab] logits buffer per chunk.
-            let h = target.hidden(promptArr[0..., prefilled ..< endIdx], cache: targetCache)
+            let h = target.hidden(suffixArr[0..., prefilled ..< endIdx], cache: targetCache)
             eval(h)
             hiddenChunks.append(h)
             GPU.clearCache()
             prefilled = endIdx
         }
-        let promptHidden = concatenated(hiddenChunks, axis: 1)
-        eval(promptHidden)
-        let lastHidden = promptHidden[0..., (promptHidden.dim(1) - 1)..., 0...]
+        let suffixHidden = concatenated(hiddenChunks, axis: 1)
+        eval(suffixHidden)
+        let lastHidden = suffixHidden[0..., (suffixHidden.dim(1) - 1)..., 0...]
         var bonus = argMax(target.logits(fromHidden: lastHidden), axis: -1).item(Int.self)
 
         var output: [Int] = [bonus]
-        drafter.reset(target: target)
+        if !resuming {
+            drafter.reset(target: target)
+        }
+        // On resume this EXTENDS the drafter cache: pairing starts at the suffix (the drafter
+        // already holds pairs up to the session's last token) and re-seeds from the new end.
         drafter.prefillFromTargetHidden(
-            inputIds: promptArr, hidden: promptHidden, bonusToken: bonus)
+            inputIds: suffixArr, hidden: suffixHidden, bonusToken: bonus)
+
+        // The session now represents exactly the full prompt.
+        session?.caches = targetCache
+        session?.tokens = promptTokens
+        session?.invalidated = false
 
         var proposed = 0
         var accepted = 0
@@ -392,7 +428,13 @@ extension Qwen35MTP {
             output.append(contentsOf: newToks)
             // Stream this round's committed tokens (accepted drafts + the correction).
             if !newToks.isEmpty, onTokens?(newToks) == false { cancelled = true }
-            if hitEOS { break }
+            if hitEOS {
+                // The verify block was cut short of the rollback bookkeeping — the caches no
+                // longer match a clean token prefix, so this session can't be resumed. (EOS
+                // ends the turn's final step; the next turn re-prefills anyway.)
+                session?.invalidated = true
+                break
+            }
 
             // Roll back the target cache to EXACTLY [bonus] + accepted drafts — the correction
             // is the NEXT bonus and stays out of the cache. On full acceptance the cache already
@@ -431,6 +473,10 @@ extension Qwen35MTP {
             drafter.acceptVerifiedTokens(
                 verifyHidden: verifyHidden, draftTokens: draftArr,
                 accepted: acc, newTokens: newToks)
+
+            // The caches now hold exactly [.. round bonus + accepted drafts] — mirror that in
+            // the session (the round's correction becomes the next bonus and stays out).
+            session?.tokens += [bonus] + draftTokens.prefix(acc)
 
             bonus = newToks.last ?? bonus
         }
