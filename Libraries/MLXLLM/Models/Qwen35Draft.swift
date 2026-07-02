@@ -345,13 +345,13 @@ extension Qwen35MTP {
             for c in targetCache { (c as? MambaCache)?.captureVerify = true }
             targetForwards += 1
             let (verifyHidden, verifyLogits) = target.hiddenAndLogits(verifyArr, cache: targetCache)
-            eval(verifyHidden, verifyLogits)
-            // Materialize the per-step capture so it doesn't alias the (now-stale) verify graph.
-            for c in targetCache {
-                guard let m = c as? MambaCache, !m.capturedSSM.isEmpty else { continue }
-                eval(m.capturedConv + m.capturedSSM)
-            }
-            let targetPreds = argMax(verifyLogits, axis: -1).asArray(Int32.self).map { Int($0) }
+            // ONE sync per verify: fold the argmax into the same evaluation as the hidden states,
+            // so the full [1, K, vocab] logits are reduced inside the graph and the captured
+            // per-step states stay lazy — only the SELECTED rollback state is materialized below
+            // (on full acceptance the captures are discarded without ever being computed).
+            let targetPredsArr = argMax(verifyLogits, axis: -1).asType(.int32)
+            eval(verifyHidden, targetPredsArr)
+            let targetPreds = targetPredsArr.asArray(Int32.self).map { Int($0) }
 
             let budget = maxTokens - output.count
             let (acc, newToksRaw) = speculativeWalk(
@@ -380,15 +380,22 @@ extension Qwen35MTP {
             if acc < draftTokens.count {
                 let keepOffset = preVerifyOffset + acc + 1
                 let drop = draftTokens.count - acc  // rejected drafts to drop from the verify block
+                var selectedStates: [MLXArray] = []
                 for c in targetCache {
                     if let mamba = c as? MambaCache {
                         mamba[0] = mamba.capturedConv[acc]
                         mamba[1] = mamba.capturedSSM[acc]
                         (mamba as BaseKVCache).offset = keepOffset
+                        selectedStates.append(mamba.capturedConv[acc])
+                        selectedStates.append(mamba.capturedSSM[acc])
                     } else if let base = c as? BaseKVCache, base.isTrimmable {
                         _ = base.trim(drop)
                     }
                 }
+                // Materialize ONLY the selected rollback state (index `acc`) — one state per
+                // gated-delta layer instead of all K — cutting it loose from the verify graph
+                // before the captures are cleared. States past `acc` are never computed.
+                if !selectedStates.isEmpty { eval(selectedStates) }
             }
             // Clear capture state for the next round.
             for c in targetCache {
