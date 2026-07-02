@@ -319,6 +319,7 @@ extension Qwen35MTP {
         promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>,
         blockSize: Int? = nil,
         prefillStep: Int = 256,
+        adaptiveCeiling: Int = 6,
         session: Qwen35MTPSession? = nil,
         onTokens: (([Int]) -> Bool)? = nil
     ) -> Qwen35MTPResult {
@@ -326,6 +327,12 @@ extension Qwen35MTP {
         // caches (and the drafter's) and prefill only the suffix. Otherwise start fresh
         // (and re-prime the session so the NEXT step can resume).
         let resuming = session?.canResume(prompt: promptTokens) ?? false
+        if !resuming {
+            // Release the stale session's ~350 MB of caches BEFORE allocating fresh ones —
+            // holding both across the prefill doubles the peak and trips jetsam on-device.
+            session?.caches = []
+            session?.tokens = []
+        }
         let targetCache = resuming ? session!.caches : target.newCache(parameters: nil)
         let suffixStart = resuming ? session!.tokens.count : 0
         let suffixTokens = Array(promptTokens[suffixStart...])
@@ -372,7 +379,8 @@ extension Qwen35MTP {
         var targetForwards = 0  // full-model forwards in the decode loop (verify + re-forwards)
         var rounds = 0
         var acceptLens: [Int] = []  // accepted drafts per round — drives the Adaptive block size
-        let adaptiveCeiling = 6     // Adaptive grows from the drafter's trained depth toward this
+        // Adaptive grows from the drafter's trained depth toward `adaptiveCeiling`; each unit
+        // of ceiling costs ~layers × 8.4 MB of verify-capture transient — cap it on-device.
         // Stream the first bonus token; `onTokens` returning false requests cancellation.
         var cancelled = (onTokens?([bonus]) == false)
 
