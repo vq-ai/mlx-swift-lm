@@ -277,23 +277,44 @@ final class Qwen35GatedDeltaNet: Module {
         var out: MLXArray
 
         if cache?.captureVerify == true {
-            // Speculative verify. The capture-variant kernel emits the SSM state after EVERY
-            // token straight from the single whole-block scan (bit-identical to the plain scan;
-            // no token-by-token re-scan), so a rejection can roll back without a full-model
-            // re-forward. Conv state after token t is the (kernelSize-1)-wide window of
-            // `convInput` ending at t.
-            let (o, finalState, ssmSteps) = gatedDeltaUpdateCaptured(
-                q: qNormed, k: kNormed, v: v, a: a, b: b,
-                aLog: aLog, dtBias: dtBias, state: state, mask: mask)
-            out = o
-            state = finalState
+            // Speculative verify with per-step state capture for rollback. Two modes:
+            // .kernelScan — the capture-variant kernel emits every post-token state from the
+            //   single scan (fastest; materializes layers × K × stateSize per round — fine on
+            //   Macs, too big for iPhone jetsam limits).
+            // .lazyRescan — whole-block scan for the output + a LAZY per-token rescan; only
+            //   the selected rollback state is ever materialized (memory-light, exact).
+            if Qwen35MTP.captureMode == .kernelScan {
+                let (o, finalState, ssmSteps) = gatedDeltaUpdateCaptured(
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+                out = o
+                state = finalState
+                cache?.capturedSSM = ssmSteps
+            } else {
+                let initialState = state
+                (out, state) = gatedDeltaUpdate(
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+                var ssmSteps: [MLXArray] = []
+                var running = initialState
+                for t in 0 ..< S {
+                    let maskT = mask == nil ? nil : mask![0..., t ..< (t + 1)]
+                    let (_, st) = gatedDeltaUpdate(
+                        q: qNormed[0..., t ..< (t + 1)], k: kNormed[0..., t ..< (t + 1)],
+                        v: v[0..., t ..< (t + 1)], a: a[0..., t ..< (t + 1)],
+                        b: b[0..., t ..< (t + 1)], aLog: aLog, dtBias: dtBias,
+                        state: running, mask: maskT)
+                    running = st
+                    ssmSteps.append(st)
+                }
+                cache?.capturedSSM = ssmSteps
+            }
             var convSteps: [MLXArray] = []
             for t in 0 ..< S {
                 convSteps.append(
                     contiguous(convInput[0..., (t + 1) ..< (t + convKernelSize), 0...]))
             }
             cache?.capturedConv = convSteps
-            cache?.capturedSSM = ssmSteps
         } else {
             (out, state) = gatedDeltaUpdate(
                 q: qNormed,

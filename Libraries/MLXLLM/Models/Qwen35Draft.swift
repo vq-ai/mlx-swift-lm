@@ -281,6 +281,9 @@ extension Qwen35Model {
 /// states can't rewind, so resume is prefix-extension-only; any other prompt falls back to a
 /// fresh prefill (and re-primes this session). The drafter's cache rides along implicitly
 /// (same `Qwen35DraftModel` instance, not reset on resume) — pass the same drafter.
+/// How the speculative verify captures per-step gated-delta states for rollback.
+public enum Qwen35CaptureMode: Sendable { case kernelScan, lazyRescan }
+
 public final class Qwen35MTPSession {
     public internal(set) var caches: [KVCache] = []
     public internal(set) var tokens: [Int] = []
@@ -311,6 +314,10 @@ public struct Qwen35MTPResult {
 }
 
 extension Qwen35MTP {
+    /// Verify capture strategy — memory-tight hosts (iPhone) should use `.lazyRescan`.
+    /// nonisolated(unsafe): set once at startup before any generation.
+    public nonisolated(unsafe) static var captureMode: Qwen35CaptureMode = .kernelScan
+
     /// Greedy MTP self-speculative decode. Exact: the emitted token ids are identical to plain
     /// greedy decode of the target. Returns the generated tokens (excluding the prompt) plus
     /// draft proposal/acceptance counts.
@@ -443,6 +450,8 @@ extension Qwen35MTP {
                 // longer match a clean token prefix, so this session can't be resumed. (EOS
                 // ends the turn's final step; the next turn re-prefills anyway.)
                 session?.invalidated = true
+                session?.caches = []   // release, not retain — the turn is over
+                session?.tokens = []
                 break
             }
 
