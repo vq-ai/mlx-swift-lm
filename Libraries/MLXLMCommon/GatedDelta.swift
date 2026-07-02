@@ -26,8 +26,21 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool, capture: Bool = false) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    // Capture variant: also write the state AFTER each token to `states_all`
+    // ([B, T, Hv, Dv, Dk]) straight from the scan registers — a speculative-verify rollback
+    // then just slices the state at the accepted index, with no re-scan. Masked steps write
+    // the unchanged state, matching the re-scan semantics.
+    let captureSource = capture ? """
+              {
+                auto cap = states_all + (((b_idx * T + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  cap[s_idx] = static_cast<StT>(state[i]);
+                }
+              }
+        """ : ""
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -86,6 +99,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               } else {
                 y[dv_idx] = static_cast<InT>(0);
               }
+        \(captureSource)
               // Increment data pointers to next time step
               q_ += Hk * Dk;
               k_ += Hk * Dk;
@@ -105,12 +119,17 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         inputNames.append("mask")
     }
 
-    let suffix = hasMask ? "_mask" : ""
+    var outputNames = ["y", "state_out"]
+    if capture {
+        outputNames.append("states_all")
+    }
+
+    let suffix = (hasMask ? "_mask" : "") + (capture ? "_capture" : "")
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
         inputNames: inputNames,
-        outputNames: ["y", "state_out"],
+        outputNames: outputNames,
         source: source
     )
 }
@@ -120,10 +139,14 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let kernelCapture: MLXFast.MLXFastKernel?
+    let kernelMaskedCapture: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernelCapture = makeGatedDeltaKernel(hasMask: false, capture: true)
+        kernelMaskedCapture = makeGatedDeltaKernel(hasMask: true, capture: true)
     }
 }
 
@@ -177,6 +200,59 @@ func gatedDeltaKernel(
     )
 
     return (outputs[0], outputs[1])
+}
+
+/// Capture-variant dispatch: same scan, but additionally emits the post-token state for EVERY
+/// position as `statesAll` ([B, T, Hv, Dv, Dk]) — written from the scan registers, so it is
+/// bit-identical to running the scan token-by-token, at the cost of one extra store per step.
+func gatedDeltaKernelCaptured(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray, MLXArray) {
+    let B = k.dim(0)
+    let T = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let inputType = q.dtype
+    let stateType = state.dtype
+
+    let selectedKernel: MLXFast.MLXFastKernel?
+    var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    if let mask {
+        selectedKernel = GatedDeltaKernelManager.shared.kernelMaskedCapture
+        inputs.append(mask)
+    } else {
+        selectedKernel = GatedDeltaKernelManager.shared.kernelCapture
+    }
+
+    guard let kernel = selectedKernel else {
+        fatalError("Gated delta capture kernel not available")
+    }
+
+    let outputs = kernel(
+        inputs,
+        template: [
+            ("InT", inputType),
+            ("StT", stateType),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], state.shape, [B, T, Hv, Dv, Dk]],
+        outputDTypes: [inputType, stateType, stateType]
+    )
+
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 // MARK: - Ops Fallback
@@ -311,4 +387,61 @@ public func gatedDeltaUpdate(
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+/// Like ``gatedDeltaUpdate(q:k:v:a:b:aLog:dtBias:state:mask:)``, but also returns the state
+/// AFTER each token — `steps[t]` is the `[B, Hv, Dv, Dk]` state having consumed tokens `0...t`
+/// (`steps[T-1]` equals the returned final state). On the Metal path the per-step states come
+/// straight out of the single scan (no re-scan); the ops fallback runs the scan token-by-token.
+/// Used by speculative-verify capture so a rejection can roll back to the accepted position.
+public func gatedDeltaUpdateCaptured(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray, [MLXArray]) {
+    let beta = sigmoid(b).asType(.float32)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
+
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, q.dim(3)], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
+
+    if GatedDeltaKernelManager.shared.kernelCapture != nil {
+        let (y, final, statesAll) = gatedDeltaKernelCaptured(
+            q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+        // Per-step views into the packed buffer; `contiguous` cuts a kept slice loose from the
+        // whole [B, T, ...] buffer so a rollback doesn't pin T× state memory across rounds.
+        let steps = (0 ..< T).map { t in
+            contiguous(statesAll[0..., t, 0..., 0..., 0...])
+        }
+        return (y, final, steps)
+    }
+
+    // Ops fallback: sequential per-token scan (also the reference for kernel parity in tests).
+    var running = state
+    var ys: [MLXArray] = []
+    var steps: [MLXArray] = []
+    for t in 0 ..< T {
+        let maskT = mask == nil ? nil : mask![0..., t ..< (t + 1)]
+        let (y, st) = gatedDeltaOps(
+            q: q[0..., t ..< (t + 1)], k: k[0..., t ..< (t + 1)], v: v[0..., t ..< (t + 1)],
+            g: g[0..., t ..< (t + 1)], beta: beta[0..., t ..< (t + 1)],
+            state: running, mask: maskT)
+        ys.append(y)
+        steps.append(st)
+        running = st
+    }
+    return (concatenated(ys, axis: 1), running, steps)
 }

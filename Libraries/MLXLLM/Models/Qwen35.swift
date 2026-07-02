@@ -277,27 +277,18 @@ final class Qwen35GatedDeltaNet: Module {
         var out: MLXArray
 
         if cache?.captureVerify == true {
-            // Speculative verify. Compute the block output via the normal whole-block scan
-            // (bit-identical to baseline), and SEPARATELY capture the SSM + conv state after
-            // each token via a per-token scan (the recurrence is associative, so this matches
-            // exactly) so a rejection can roll back without a full-model re-forward. Conv state
-            // after token t is the (kernelSize-1)-wide window of `convInput` ending at t.
-            let initialState = state
-            (out, state) = gatedDeltaUpdate(
+            // Speculative verify. The capture-variant kernel emits the SSM state after EVERY
+            // token straight from the single whole-block scan (bit-identical to the plain scan;
+            // no token-by-token re-scan), so a rejection can roll back without a full-model
+            // re-forward. Conv state after token t is the (kernelSize-1)-wide window of
+            // `convInput` ending at t.
+            let (o, finalState, ssmSteps) = gatedDeltaUpdateCaptured(
                 q: qNormed, k: kNormed, v: v, a: a, b: b,
                 aLog: aLog, dtBias: dtBias, state: state, mask: mask)
-            var ssmSteps: [MLXArray] = []
+            out = o
+            state = finalState
             var convSteps: [MLXArray] = []
-            var running = initialState
             for t in 0 ..< S {
-                let maskT = mask == nil ? nil : mask![0..., t ..< (t + 1)]
-                let (_, st) = gatedDeltaUpdate(
-                    q: qNormed[0..., t ..< (t + 1)], k: kNormed[0..., t ..< (t + 1)],
-                    v: v[0..., t ..< (t + 1)], a: a[0..., t ..< (t + 1)],
-                    b: b[0..., t ..< (t + 1)], aLog: aLog, dtBias: dtBias,
-                    state: running, mask: maskT)
-                running = st
-                ssmSteps.append(st)
                 convSteps.append(
                     contiguous(convInput[0..., (t + 1) ..< (t + convKernelSize), 0...]))
             }
