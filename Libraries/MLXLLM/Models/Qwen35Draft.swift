@@ -306,6 +306,8 @@ public struct Qwen35MTPResult {
     /// Number of speculation rounds (≈ target forwards). With `proposed`, gives the average
     /// block size actually used (useful to see what Adaptive settled on).
     public var rounds: Int = 0
+    /// Resume telemetry: -1 = fresh prefill; otherwise the suffix length prefilled on resume.
+    public var resumedSuffix: Int = -1
 }
 
 extension Qwen35MTP {
@@ -483,6 +485,7 @@ extension Qwen35MTP {
 
         return Qwen35MTPResult(
             tokens: Array(output.prefix(maxTokens)), proposed: proposed, accepted: accepted,
-            targetForwards: targetForwards, rounds: rounds)
+            targetForwards: targetForwards, rounds: rounds,
+            resumedSuffix: resuming ? suffixTokens.count : -1)
     }
 }
