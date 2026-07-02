@@ -242,6 +242,18 @@ extension Qwen35TextModel {
         let logits = lmHead?(hidden) ?? model.embedTokens.asLinear(hidden)
         return (hidden, logits)
     }
+
+    /// Hidden states only (no LM head), advancing `cache`. Prefill uses this: computing the
+    /// full-vocab logits for every prompt position wastes an LM-head matmul + logits buffer
+    /// per chunk when only the LAST position's logits are needed (the first bonus token).
+    public func hidden(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        model(inputs, cache: cache)
+    }
+
+    /// Apply the LM head to (a slice of) hidden states.
+    public func logits(fromHidden hidden: MLXArray) -> MLXArray {
+        lmHead?(hidden) ?? model.embedTokens.asLinear(hidden)
+    }
 }
 
 extension Qwen35Model {
@@ -249,6 +261,14 @@ extension Qwen35Model {
         _ inputs: MLXArray, cache: [KVCache]?
     ) -> (hidden: MLXArray, logits: MLXArray) {
         languageModel.hiddenAndLogits(inputs, cache: cache)
+    }
+
+    public func hidden(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        languageModel.hidden(inputs, cache: cache)
+    }
+
+    public func logits(fromHidden hidden: MLXArray) -> MLXArray {
+        languageModel.logits(fromHidden: hidden)
     }
 }
 
@@ -274,33 +294,35 @@ extension Qwen35MTP {
         target: Qwen35Model, drafter: Qwen35DraftModel,
         promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>,
         blockSize: Int? = nil,
+        prefillStep: Int = 256,
         onTokens: (([Int]) -> Bool)? = nil
     ) -> Qwen35MTPResult {
         let targetCache = target.newCache(parameters: nil)
 
         // Prefill the target over the prompt IN CHUNKS — a single full-prompt forward spikes
         // activation memory and OOM-kills memory-tight devices (iPhone: ~400 MB headroom) on
-        // long RAG prompts. Collect the per-position hidden states (the drafter is prefilled
-        // from them) and keep the last chunk's logits for the first bonus token.
+        // long RAG prompts. The chunk size trades prefill speed (bigger amortizes weight reads)
+        // against peak activation memory — the default stays device-safe; hosts with headroom
+        // can raise it. Collect the per-position hidden states (the drafter is prefilled from
+        // them) and keep the last chunk's logits for the first bonus token.
         let promptArr = MLXArray(promptTokens.map { Int32($0) }).reshaped([1, promptTokens.count])
-        let prefillStep = 256
         var hiddenChunks: [MLXArray] = []
-        var lastChunkLogits = MLXArray.zeros([1, 1, 1])
         var prefilled = 0
         while prefilled < promptTokens.count {
             let endIdx = min(prefilled + prefillStep, promptTokens.count)
-            let (h, l) = target.hiddenAndLogits(
-                promptArr[0..., prefilled ..< endIdx], cache: targetCache)
-            eval(h, l)
+            // Hidden states only — the LM head runs ONCE below, on the final position. Computing
+            // full-vocab logits for every prompt position wasted an LM-head matmul (~0.6 GFLOP
+            // per position) plus a [chunk, vocab] logits buffer per chunk.
+            let h = target.hidden(promptArr[0..., prefilled ..< endIdx], cache: targetCache)
+            eval(h)
             hiddenChunks.append(h)
-            lastChunkLogits = l
             GPU.clearCache()
             prefilled = endIdx
         }
         let promptHidden = concatenated(hiddenChunks, axis: 1)
         eval(promptHidden)
-        var bonus = argMax(lastChunkLogits[0..., (lastChunkLogits.dim(1) - 1)..., 0...], axis: -1)
-            .item(Int.self)
+        let lastHidden = promptHidden[0..., (promptHidden.dim(1) - 1)..., 0...]
+        var bonus = argMax(target.logits(fromHidden: lastHidden), axis: -1).item(Int.self)
 
         var output: [Int] = [bonus]
         drafter.reset(target: target)
