@@ -289,9 +289,10 @@ public final class Qwen35MTPSession {
     public internal(set) var tokens: [Int] = []
     /// Set when the caches stopped matching `tokens` exactly.
     public internal(set) var invalidated = true
-    /// Set when the drafter skipped its end-of-round update (EOS path) — the next resume
-    /// resets it and re-primes from the suffix only (slight accept dip; exactness unaffected).
-    public internal(set) var drafterStale = false
+    /// The final emitted token NOT yet in `tokens`/caches (the last round's correction).
+    /// nil after an EOS end (everything emitted is already consumed). A resuming caller builds
+    /// its next prompt as `tokens + [pendingFinalToken] + new-message tokens`.
+    public internal(set) var pendingFinalToken: Int?
     /// Accepted-draft history carried ACROSS steps: tool-call steps are short (~9 rounds), so a
     /// per-generate history never reaches the adaptive controller's warm-up — carrying it lets
     /// blocks grow where acceptance supports it (formulaic tool calls hit 89-100%).
@@ -375,9 +376,8 @@ extension Qwen35MTP {
         var bonus = argMax(target.logits(fromHidden: lastHidden), axis: -1).item(Int.self)
 
         var output: [Int] = [bonus]
-        if !resuming || session?.drafterStale == true {
+        if !resuming {
             drafter.reset(target: target)
-            session?.drafterStale = false
         }
         // On resume this EXTENDS the drafter cache: pairing starts at the suffix (the drafter
         // already holds pairs up to the session's last token) and re-seeds from the new end.
@@ -482,8 +482,15 @@ extension Qwen35MTP {
                     mamba.capturedConv = []
                     mamba.capturedSSM = []
                 }
+                // Align the drafter exactly like a rejection at `keep` (newToks are all drafts
+                // here — the correction never survives an EOS trim), so it keeps its full-turn
+                // context for the next step. Empty newTokens: the next step's suffix prefill
+                // re-seeds it.
+                drafter.acceptVerifiedTokens(
+                    verifyHidden: verifyHidden, draftTokens: draftArr,
+                    accepted: keep, newTokens: [])
                 session?.tokens += [bonus] + draftTokens.prefix(keep)
-                session?.drafterStale = true
+                session?.pendingFinalToken = nil
                 break
             }
 
@@ -526,8 +533,9 @@ extension Qwen35MTP {
                 accepted: acc, newTokens: newToks)
 
             // The caches now hold exactly [.. round bonus + accepted drafts] — mirror that in
-            // the session (the round's correction becomes the next bonus and stays out).
+            // the session; the round's correction becomes the next bonus and stays out (pending).
             session?.tokens += [bonus] + draftTokens.prefix(acc)
+            session?.pendingFinalToken = newToks.last
 
             bonus = newToks.last ?? bonus
         }
