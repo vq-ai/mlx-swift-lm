@@ -147,3 +147,62 @@ struct Qwen35MTPDecodeTests {
         #expect((s[1] .== (MLXArray.ones([1, 4, 4]) * 3)).all().item(Bool.self))
     }
 }
+
+/// The pure sampled speculative-decoding walk — deterministic drafts verified by the
+/// rejection rule (accept draft i with probability p_target(draft_i); on rejection the
+/// correction is the pre-drawn residual sample; on full acceptance the final sample).
+@Suite
+struct Qwen35MTPSampledWalkTests {
+
+    @Test func allAcceptedTakesFinalSample() {
+        // u_i < p_i everywhere → all drafts accepted + the final-row sample.
+        let r = Qwen35MTP.speculativeWalkSampled(
+            draftTokens: [5, 6], pDraft: [0.9, 0.8], uniforms: [0.5, 0.5],
+            residualSamples: [11, 12], finalSample: 7, budget: 10)
+        #expect(r.accepted == 2)
+        #expect(r.newTokens == [5, 6, 7])
+    }
+
+    @Test func rejectionTakesResidualAtThatRow() {
+        // Row 0 accepts (0.3 < 0.9); row 1 rejects (0.9 >= 0.2) → residual sample of row 1.
+        let r = Qwen35MTP.speculativeWalkSampled(
+            draftTokens: [5, 6], pDraft: [0.9, 0.2], uniforms: [0.3, 0.9],
+            residualSamples: [11, 12], finalSample: 7, budget: 10)
+        #expect(r.accepted == 1)
+        #expect(r.newTokens == [5, 12])
+    }
+
+    @Test func firstRowRejection() {
+        let r = Qwen35MTP.speculativeWalkSampled(
+            draftTokens: [5, 6], pDraft: [0.1, 0.9], uniforms: [0.5, 0.1],
+            residualSamples: [11, 12], finalSample: 7, budget: 10)
+        #expect(r.accepted == 0)
+        #expect(r.newTokens == [11])
+    }
+
+    @Test func budgetTruncates() {
+        let r = Qwen35MTP.speculativeWalkSampled(
+            draftTokens: [5, 6], pDraft: [0.9, 0.8], uniforms: [0.1, 0.1],
+            residualSamples: [11, 12], finalSample: 7, budget: 2)
+        #expect(r.accepted == 2)
+        #expect(r.newTokens == [5, 6])
+    }
+
+    @Test func emptyDraftEmitsFinalSample() {
+        // blockSize 1: no drafts — the walk reduces to plain sampling of one token.
+        let r = Qwen35MTP.speculativeWalkSampled(
+            draftTokens: [], pDraft: [], uniforms: [],
+            residualSamples: [], finalSample: 42, budget: 10)
+        #expect(r.accepted == 0)
+        #expect(r.newTokens == [42])
+    }
+
+    @Test func boundaryEqualUniformRejects() {
+        // u == p rejects (accept iff u < p) — pins the comparison direction.
+        let r = Qwen35MTP.speculativeWalkSampled(
+            draftTokens: [5], pDraft: [0.5], uniforms: [0.5],
+            residualSamples: [11], finalSample: 7, budget: 10)
+        #expect(r.accepted == 0)
+        #expect(r.newTokens == [11])
+    }
+}

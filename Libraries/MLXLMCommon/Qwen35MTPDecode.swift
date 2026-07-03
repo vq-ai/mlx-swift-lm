@@ -42,6 +42,69 @@ public enum Qwen35MTP {
         return (accepted, Array(newTokens.prefix(max(0, budget))))
     }
 
+    /// Sampling configuration for MTP speculative decoding.
+    ///
+    /// With sampling active, verification switches from exact-greedy token matching to the
+    /// standard rejection rule for a *deterministic* draft distribution: draft token `d_i`
+    /// is accepted with probability `p_target(d_i)` (after temperature / top-p / repetition
+    /// transforms); on rejection the correction is sampled from the residual distribution
+    /// (`p_target` with `d_i` zeroed, renormalized). The emitted stream is then an exact
+    /// sample from the same distribution the standard (non-speculative) sampled decode
+    /// produces — speculation changes speed, never the distribution.
+    public struct Sampling: Sendable {
+        /// Softmax temperature; must be > 0 (use `nil` Sampling for greedy).
+        public var temperature: Float
+        /// Nucleus threshold; 1 disables the top-p mask.
+        public var topP: Float
+        /// CTRL-style repetition penalty (>1 penalizes); `nil` disables.
+        public var repetitionPenalty: Float?
+        /// Ring size for the repetition context (matches `RepetitionContext`).
+        public var repetitionContextSize: Int
+        /// Seed for reproducible generation (trajectory capture / benchmarks); `nil` = random.
+        public var seed: UInt64?
+
+        public init(
+            temperature: Float, topP: Float = 1.0,
+            repetitionPenalty: Float? = nil, repetitionContextSize: Int = 200,
+            seed: UInt64? = nil
+        ) {
+            self.temperature = temperature
+            self.topP = topP
+            self.repetitionPenalty = repetitionPenalty
+            self.repetitionContextSize = repetitionContextSize
+            self.seed = seed
+        }
+    }
+
+    /// Sampled speculative-decoding walk (deterministic drafts, exact target distribution).
+    ///
+    /// Pure function so the accept/reject math is unit-testable without models: the caller
+    /// supplies per-position acceptance probabilities and pre-drawn samples.
+    ///
+    /// - Parameters:
+    ///   - draftTokens: the `K-1` tokens proposed by the drafter for this round.
+    ///   - pDraft: `p_target(d_i)` for each draft position (length `draftTokens.count`).
+    ///   - uniforms: pre-drawn U(0,1) per draft position; `u_i < p_i` accepts `d_i`.
+    ///   - residualSamples: per position, a sample from the residual distribution
+    ///     (target with the draft token excluded) — used when position `i` rejects.
+    ///   - finalSample: a sample from the last verify row's full distribution — the
+    ///     bonus/correction when every draft is accepted.
+    ///   - budget: maximum number of new tokens to emit this round.
+    /// - Returns: `accepted` and `newTokens`, same contract as ``speculativeWalk``.
+    public static func speculativeWalkSampled(
+        draftTokens: [Int], pDraft: [Float], uniforms: [Float],
+        residualSamples: [Int], finalSample: Int, budget: Int
+    ) -> (accepted: Int, newTokens: [Int]) {
+        precondition(pDraft.count == draftTokens.count && uniforms.count == draftTokens.count)
+        precondition(residualSamples.count == draftTokens.count)
+        for i in draftTokens.indices where uniforms[i] >= pDraft[i] {
+            let newTokens = Array(draftTokens.prefix(i)) + [residualSamples[i]]
+            return (i, Array(newTokens.prefix(max(0, budget))))
+        }
+        let newTokens = draftTokens + [finalSample]
+        return (draftTokens.count, Array(newTokens.prefix(max(0, budget))))
+    }
+
     /// Adaptive MTP block size — ported from mlx-vlm `_effective_mtp_block_size`
     /// (speculative/mtp.py). Grows from the drafter's configured (trained) depth toward
     /// `requestedBlock` only when the base depth's drafts are fully accepted often enough

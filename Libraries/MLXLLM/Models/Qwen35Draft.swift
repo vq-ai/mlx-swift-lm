@@ -338,23 +338,141 @@ public struct Qwen35MTPResult {
     public var resumedSuffix: Int = -1
 }
 
+/// Draws the per-round sampling outcomes for the sampled speculative verify.
+///
+/// All heavy tensors ([K, V] transforms, gumbel noise) stay lazy inside the caller's verify
+/// evaluation; only the tiny outcome vectors ([K] floats/ints) are materialized. The
+/// transforms mirror the standard sampled path EXACTLY (RepetitionContext's CTRL-style
+/// penalty, then `TopPSampler`'s top-p-on-untempered-logprobs, then temperature inside the
+/// categorical) so speculative decode samples from the same distribution as non-speculative.
+private struct Qwen35SampledVerifier {
+    let sampling: Qwen35MTP.Sampling
+    let randomState: MLXRandom.RandomState
+
+    init(sampling: Qwen35MTP.Sampling) {
+        self.sampling = sampling
+        self.randomState = sampling.seed.map { MLXRandom.RandomState(seed: $0) }
+            ?? MLXRandom.RandomState()
+    }
+
+    /// The final log-distribution rows after penalty → top-p → temperature.
+    /// `logits`: [rows, V] float32; `ringRows`: per-row repetition-context token ids.
+    private func finalLogprobs(_ logits: MLXArray, ringRows: [[Int]]) -> MLXArray {
+        var logits = logits
+        if let penalty = sampling.repetitionPenalty, penalty != 0, penalty != 1,
+            ringRows.contains(where: { !$0.isEmpty }) {
+            // Rows may have different context lengths (in-block drafts accrue) — pad each
+            // row's id list to a common width by REPEATING its first id (a duplicate index
+            // in putAlong just rewrites the same penalized value; the transform is
+            // idempotent per token, so repeats are harmless).
+            let width = ringRows.map(\.count).max() ?? 0
+            let padded = ringRows.map { row -> [UInt32] in
+                let pad = Array(repeating: UInt32(row.first ?? 0), count: width - row.count)
+                return pad + row.map { UInt32($0) }
+            }
+            let idx = MLXArray(padded.flatMap { $0 }).reshaped([ringRows.count, width])
+            var sel = takeAlong(logits, idx, axis: -1)
+            sel = MLX.where(sel .< 0, sel * penalty, sel / penalty)
+            logits = putAlong(logits, idx, values: sel, axis: -1)
+        }
+        var logprobs = logSoftmax(logits, axis: -1)
+        if sampling.topP < 1 {
+            // Same math as TopPSampler.applyTopP: mask the low-probability tail on the
+            // UNTEMPERED logprobs, in sorted order, scatter back.
+            let sortedIndices = argSort(logprobs, axis: -1)
+            let sortedLogprobs = takeAlong(logprobs, sortedIndices, axis: -1)
+            let cumulativeProbs = cumsum(exp(sortedLogprobs), axis: -1)
+            let filtered = MLX.where(
+                cumulativeProbs .> (1 - sampling.topP), sortedLogprobs,
+                MLXArray(-Float.infinity))
+            logprobs = putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
+        }
+        return logSoftmax(logprobs * (1 / sampling.temperature), axis: -1)
+    }
+
+    /// Sample one token from a single-position logits row (the post-prefill bonus).
+    func sampleToken(logits: MLXArray, ring: [Int]) -> Int {
+        let logp = finalLogprobs(logits.reshaped([1, logits.dim(-1)]).asType(.float32),
+                                 ringRows: [ring])
+        let sampled = withRandomState(randomState) {
+            argMax(logp + MLXRandom.gumbel(logp.shape, type: Float.self), axis: -1)
+        }
+        return sampled.item(Int.self)
+    }
+
+    /// Per-round outcomes for ``Qwen35MTP/speculativeWalkSampled``.
+    ///
+    /// `verifyLogits`: [1, K, V] (row i = target's distribution after consuming
+    /// verifyInput[0...i]); `draftTokens`: the K-1 drafts; `ringRows[i]`: repetition
+    /// context for row i (base ring + drafts[0..<i]).
+    func outcomes(
+        verifyLogits: MLXArray, draftTokens: [Int], ringRows: [[Int]]
+    ) -> (pDraft: [Float], uniforms: [Float], residual: [Int], final: Int) {
+        let k = verifyLogits.dim(1)
+        precondition(draftTokens.count == k - 1 && ringRows.count == k)
+        let logp = finalLogprobs(
+            verifyLogits.squeezed(axis: 0).asType(.float32), ringRows: ringRows)  // [K, V]
+
+        let (pDraftArr, residualArr, finalArr, uniformsArr) = withRandomState(randomState) {
+            let draftRows = logp[0 ..< max(k - 1, 0), 0...]
+            let draftIdx = MLXArray(draftTokens.map { UInt32($0) }).reshaped([k - 1, 1])
+            let pDraft = exp(takeAlong(draftRows, draftIdx, axis: -1)).squeezed(axes: [-1])
+            // Residual distribution per draft row: zero out the draft token, renormalize —
+            // gumbel-argmax over the masked logprobs IS a sample from that residual.
+            let masked = putAlong(
+                draftRows, draftIdx,
+                values: broadcast(MLXArray(-Float.infinity), to: [k - 1, 1]), axis: -1)
+            let residual = argMax(
+                masked + MLXRandom.gumbel(masked.shape, type: Float.self), axis: -1)
+            let lastRow = logp[(k - 1)..., 0...]
+            let final = argMax(
+                lastRow + MLXRandom.gumbel(lastRow.shape, type: Float.self), axis: -1)
+            let uniforms = MLXRandom.uniform(low: Float(0), high: 1, [max(k - 1, 0)])
+            return (pDraft, residual, final, uniforms)
+        }
+        // One materialization for all four tiny outputs (K-sized).
+        eval(pDraftArr, residualArr, finalArr, uniformsArr)
+        return (
+            pDraft: pDraftArr.asArray(Float.self),
+            uniforms: uniformsArr.asArray(Float.self),
+            residual: residualArr.asArray(Int32.self).map { Int($0) },
+            final: finalArr.item(Int.self)
+        )
+    }
+}
+
 extension Qwen35MTP {
     /// Verify capture strategy — memory-tight hosts (iPhone) should use `.lazyRescan`.
     /// nonisolated(unsafe): set once at startup before any generation.
     public nonisolated(unsafe) static var captureMode: Qwen35CaptureMode = .kernelScan
 
-    /// Greedy MTP self-speculative decode. Exact: the emitted token ids are identical to plain
-    /// greedy decode of the target. Returns the generated tokens (excluding the prompt) plus
-    /// draft proposal/acceptance counts.
+    /// MTP self-speculative decode. With `sampling == nil` it is exact GREEDY: the emitted
+    /// token ids are identical to plain greedy decode of the target. With `sampling` set it
+    /// is exact SAMPLED: the emitted stream is a true sample from the same
+    /// temperature/top-p/repetition-penalty distribution the standard (non-speculative)
+    /// sampled decode produces — speculation changes speed, never the distribution.
+    /// Returns the generated tokens (excluding the prompt) plus draft proposal/acceptance
+    /// counts.
     public static func generate(
         target: Qwen35Model, drafter: Qwen35DraftModel,
         promptTokens: [Int], maxTokens: Int, eosTokens: Set<Int>,
         blockSize: Int? = nil,
         prefillStep: Int = 256,
         adaptiveCeiling: Int = 6,
+        sampling: Sampling? = nil,
         session: Qwen35MTPSession? = nil,
         onTokens: (([Int]) -> Bool)? = nil
     ) -> Qwen35MTPResult {
+        let verifier = sampling.flatMap { $0.temperature > 0 ? Qwen35SampledVerifier(sampling: $0) : nil }
+        let ringSize = sampling?.repetitionContextSize ?? 0
+        // Repetition ring: the last `ringSize` tokens of the TEXT stream (prompt + generated),
+        // exactly what RepetitionContext tracks on the standard path.
+        var ring: [Int] = ringSize > 0 ? Array(promptTokens.suffix(ringSize)) : []
+        func ringAppend(_ tokens: [Int]) {
+            guard ringSize > 0 else { return }
+            ring.append(contentsOf: tokens)
+            if ring.count > ringSize { ring.removeFirst(ring.count - ringSize) }
+        }
         // Resume when the prompt strictly extends the session's consumed tokens: keep the
         // caches (and the drafter's) and prefill only the suffix. Otherwise start fresh
         // (and re-prime the session so the NEXT step can resume).
@@ -390,7 +508,13 @@ extension Qwen35MTP {
         let suffixHidden = concatenated(hiddenChunks, axis: 1)
         eval(suffixHidden)
         let lastHidden = suffixHidden[0..., (suffixHidden.dim(1) - 1)..., 0...]
-        var bonus = argMax(target.logits(fromHidden: lastHidden), axis: -1).item(Int.self)
+        var bonus: Int
+        if let verifier {
+            bonus = verifier.sampleToken(logits: target.logits(fromHidden: lastHidden), ring: ring)
+        } else {
+            bonus = argMax(target.logits(fromHidden: lastHidden), axis: -1).item(Int.self)
+        }
+        ringAppend([bonus])
 
         var output: [Int] = [bonus]
         if !resuming {
@@ -446,17 +570,38 @@ extension Qwen35MTP {
             for c in targetCache { (c as? MambaCache)?.captureVerify = true }
             targetForwards += 1
             let (verifyHidden, verifyLogits) = target.hiddenAndLogits(verifyArr, cache: targetCache)
-            // ONE sync per verify: fold the argmax into the same evaluation as the hidden states,
-            // so the full [1, K, vocab] logits are reduced inside the graph and the captured
-            // per-step states stay lazy — only the SELECTED rollback state is materialized below
-            // (on full acceptance the captures are discarded without ever being computed).
-            let targetPredsArr = argMax(verifyLogits, axis: -1).asType(.int32)
-            eval(verifyHidden, targetPredsArr)
-            let targetPreds = targetPredsArr.asArray(Int32.self).map { Int($0) }
-
             let budget = maxTokens - output.count
-            let (acc, newToksRaw) = speculativeWalk(
-                draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
+            let acc: Int
+            let newToksRaw: [Int]
+            if let verifier {
+                // Sampled verify: reduce the [1, K, vocab] logits to the tiny per-round
+                // outcome vectors inside the same evaluation as the hidden states (the
+                // captured per-step states stay lazy, as in the greedy path). Row i is only
+                // consumed when drafts 0..<i were all accepted, so including the in-block
+                // draft prefix in its repetition ring matches sequential decode exactly.
+                let ringRows = (0 ..< verifyInput.count).map { i -> [Int] in
+                    let row = ring + draftTokens.prefix(i)
+                    return Array(row.suffix(max(ringSize, 1)))
+                }
+                let outcome = verifier.outcomes(
+                    verifyLogits: verifyLogits, draftTokens: draftTokens, ringRows: ringRows)
+                eval(verifyHidden)
+                (acc, newToksRaw) = speculativeWalkSampled(
+                    draftTokens: draftTokens, pDraft: outcome.pDraft,
+                    uniforms: outcome.uniforms, residualSamples: outcome.residual,
+                    finalSample: outcome.final, budget: budget)
+            } else {
+                // ONE sync per verify: fold the argmax into the same evaluation as the hidden
+                // states, so the full [1, K, vocab] logits are reduced inside the graph and the
+                // captured per-step states stay lazy — only the SELECTED rollback state is
+                // materialized below (on full acceptance the captures are discarded without
+                // ever being computed).
+                let targetPredsArr = argMax(verifyLogits, axis: -1).asType(.int32)
+                eval(verifyHidden, targetPredsArr)
+                let targetPreds = targetPredsArr.asArray(Int32.self).map { Int($0) }
+                (acc, newToksRaw) = speculativeWalk(
+                    draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
+            }
             accepted += acc
             acceptLens.append(acc)
             session?.acceptLens = acceptLens
@@ -470,6 +615,7 @@ extension Qwen35MTP {
                 hitEOS = true
             }
             output.append(contentsOf: newToks)
+            ringAppend(newToks)
             // Stream this round's committed tokens (accepted drafts + the correction).
             if !newToks.isEmpty, onTokens?(newToks) == false { cancelled = true }
             if hitEOS {
