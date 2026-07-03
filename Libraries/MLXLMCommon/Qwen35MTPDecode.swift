@@ -55,7 +55,7 @@ public enum Qwen35MTP {
         let configured = min(configuredBlock, blockTotal)
         if blockTotal <= configured || configured <= 1 { return blockTotal }
         if acceptLens.count < 8 { return configured }
-        let recent = acceptLens.suffix(32)
+        let recent = acceptLens.suffix(12)  // short window: react fast at regime changes (tool-call <-> prose)
         let configuredDraftCount = configured - 1
         let hits = recent.filter { $0 >= configuredDraftCount }.count
         let hitRate = Double(hits) / Double(recent.count)
