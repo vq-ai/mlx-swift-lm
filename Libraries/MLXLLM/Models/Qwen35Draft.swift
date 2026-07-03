@@ -292,6 +292,10 @@ public final class Qwen35MTPSession {
     /// Set when the drafter skipped its end-of-round update (EOS path) — the next resume
     /// resets it and re-primes from the suffix only (slight accept dip; exactness unaffected).
     public internal(set) var drafterStale = false
+    /// Accepted-draft history carried ACROSS steps: tool-call steps are short (~9 rounds), so a
+    /// per-generate history never reaches the adaptive controller's warm-up — carrying it lets
+    /// blocks grow where acceptance supports it (formulaic tool calls hit 89-100%).
+    public internal(set) var acceptLens: [Int] = []
 
     public init() {}
 
@@ -389,7 +393,7 @@ extension Qwen35MTP {
         var accepted = 0
         var targetForwards = 0  // full-model forwards in the decode loop (verify + re-forwards)
         var rounds = 0
-        var acceptLens: [Int] = []  // accepted drafts per round — drives the Adaptive block size
+        var acceptLens: [Int] = session?.acceptLens ?? []  // carried across steps via the session
         // Adaptive grows from the drafter's trained depth toward `adaptiveCeiling`; each unit
         // of ceiling costs ~layers × 8.4 MB of verify-capture transient — cap it on-device.
         // Stream the first bonus token; `onTokens` returning false requests cancellation.
@@ -437,6 +441,7 @@ extension Qwen35MTP {
                 draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
             accepted += acc
             acceptLens.append(acc)
+            session?.acceptLens = acceptLens
             // Stop at the first EOS among the committed tokens. EOS can be an accepted *draft*
             // mid-block (not just the round's last token), so the `bonus`-only check misses it —
             // which is why generation ran past `<|im_end|>`. Emit up to (not including) EOS.
