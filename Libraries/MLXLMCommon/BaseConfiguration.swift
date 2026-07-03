@@ -120,6 +120,17 @@ public struct BaseConfiguration: Codable, Sendable {
         var quantization: Quantization
         var perLayerQuantization: PerLayerQuantization
 
+        /// Per-layer entry with nullable fields — mlx-lm mixed-bit configs use `null` to mean
+        /// "inherit the top-level default" (see the lenient branch in `init(from:)`).
+        private struct _LenientQuantization: Codable {
+            var groupSize: Int?
+            var bits: Int?
+            enum CodingKeys: String, CodingKey {
+                case groupSize = "group_size"
+                case bits
+            }
+        }
+
         /// A custom CodingKey used to iterate over arbitrary layer names in JSON.
         internal struct _DictionaryCodingKey: CodingKey {
             internal let stringValue: String
@@ -159,10 +170,19 @@ public struct BaseConfiguration: Codable, Sendable {
                         if !f {
                             perLayerQuantization[key.stringValue] = .skip
                         }
+                    } else if let q = try? container.decode(Quantization.self, forKey: key) {
+                        // A fully-specified per-layer Quantization object
+                        perLayerQuantization[key.stringValue] = .quantize(q)
                     } else {
-                        // Otherwise, try to decode a specific Quantization object for this layer
+                        // Lenient form: mlx-lm's mixed-bit converters write per-layer entries
+                        // with `"group_size": null` (or omit fields) meaning "inherit the
+                        // top-level default" — materialize with the global values.
+                        let lenient = try container.decode(
+                            _LenientQuantization.self, forKey: key)
                         perLayerQuantization[key.stringValue] = .quantize(
-                            try container.decode(Quantization.self, forKey: key))
+                            Quantization(
+                                groupSize: lenient.groupSize ?? quantization.groupSize,
+                                bits: lenient.bits ?? quantization.bits))
                     }
                 }
             }
