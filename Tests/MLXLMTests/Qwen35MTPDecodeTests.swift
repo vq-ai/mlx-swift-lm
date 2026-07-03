@@ -78,11 +78,13 @@ struct Qwen35MTPDecodeTests {
     }
 
     @Test func adaptiveHitRateBoundary() {
-        // Exactly 65% (13/20) hits the base depth → grow; 60% (12/20) → stay.
-        let grow = [Int](repeating: 2, count: 13) + [Int](repeating: 0, count: 7)
+        // The controller looks at the last 12 rounds (short window: reacts fast at tool-call ↔
+        // prose regime changes). 8/12 ≥ 65% → grow; 7/12 < 65% → stay. Older history (the
+        // leading zeros) must be ignored.
+        let grow = [Int](repeating: 0, count: 10) + [Int](repeating: 2, count: 8)
         #expect(Qwen35MTP.effectiveBlockSize(
             requestedBlock: 6, configuredBlock: 3, acceptLens: grow, remainingBudget: 100) == 6)
-        let stay = [Int](repeating: 2, count: 12) + [Int](repeating: 0, count: 8)
+        let stay = [Int](repeating: 0, count: 5) + [Int](repeating: 2, count: 7)
         #expect(Qwen35MTP.effectiveBlockSize(
             requestedBlock: 6, configuredBlock: 3, acceptLens: stay, remainingBudget: 100) == 3)
     }
