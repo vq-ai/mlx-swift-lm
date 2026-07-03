@@ -287,8 +287,11 @@ public enum Qwen35CaptureMode: Sendable { case kernelScan, lazyRescan }
 public final class Qwen35MTPSession {
     public internal(set) var caches: [KVCache] = []
     public internal(set) var tokens: [Int] = []
-    /// Set when the caches stopped matching `tokens` exactly (EOS cut a verify block short).
+    /// Set when the caches stopped matching `tokens` exactly.
     public internal(set) var invalidated = true
+    /// Set when the drafter skipped its end-of-round update (EOS path) — the next resume
+    /// resets it and re-primes from the suffix only (slight accept dip; exactness unaffected).
+    public internal(set) var drafterStale = false
 
     public init() {}
 
@@ -368,8 +371,9 @@ extension Qwen35MTP {
         var bonus = argMax(target.logits(fromHidden: lastHidden), axis: -1).item(Int.self)
 
         var output: [Int] = [bonus]
-        if !resuming {
+        if !resuming || session?.drafterStale == true {
             drafter.reset(target: target)
+            session?.drafterStale = false
         }
         // On resume this EXTENDS the drafter cache: pairing starts at the suffix (the drafter
         // already holds pairs up to the session's last token) and re-seeds from the new end.
@@ -446,12 +450,35 @@ extension Qwen35MTP {
             // Stream this round's committed tokens (accepted drafts + the correction).
             if !newToks.isEmpty, onTokens?(newToks) == false { cancelled = true }
             if hitEOS {
-                // The verify block was cut short of the rollback bookkeeping — the caches no
-                // longer match a clean token prefix, so this session can't be resumed. (EOS
-                // ends the turn's final step; the next turn re-prefills anyway.)
-                session?.invalidated = true
-                session?.caches = []   // release, not retain — the turn is over
-                session?.tokens = []
+                // Roll the caches back to just before the EOS token — the same machinery as a
+                // rejection — so the session STAYS resumable: tool-call steps routinely end
+                // fence + im_end in one round, and the next step's delta re-supplies the
+                // turn-close explicitly. The drafter skipped its round update (stale).
+                let keep = newToks.count  // tokens kept from the verify block, before EOS
+                if draftTokens.count - keep > 0 {
+                    let keepOffset = preVerifyOffset + keep + 1
+                    var selectedStates: [MLXArray] = []
+                    for c in targetCache {
+                        if let mamba = c as? MambaCache {
+                            mamba[0] = mamba.capturedConv[keep]
+                            mamba[1] = mamba.capturedSSM[keep]
+                            (mamba as BaseKVCache).offset = keepOffset
+                            selectedStates.append(mamba.capturedConv[keep])
+                            selectedStates.append(mamba.capturedSSM[keep])
+                        } else if let base = c as? BaseKVCache, base.isTrimmable {
+                            _ = base.trim(draftTokens.count - keep)
+                        }
+                    }
+                    if !selectedStates.isEmpty { eval(selectedStates) }
+                }
+                for c in targetCache {
+                    guard let mamba = c as? MambaCache else { continue }
+                    mamba.captureVerify = false
+                    mamba.capturedConv = []
+                    mamba.capturedSSM = []
+                }
+                session?.tokens += [bonus] + draftTokens.prefix(keep)
+                session?.drafterStale = true
                 break
             }
 
