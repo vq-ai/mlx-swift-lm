@@ -125,12 +125,29 @@ public final class Qwen35DraftModel: Module {
 
     /// Prefill the drafter cache by pairing the target's per-position hidden states with the
     /// left-shifted input tokens + the bonus, then seed the first draft from the last position.
-    public func prefillFromTargetHidden(inputIds: MLXArray, hidden: MLXArray, bonusToken: Int) {
+    /// Chunked like the target's prefill: a single full-length forward materializes O(L²)
+    /// attention scores in the drafter's full-attention layer (~1.3 GB at 6k ctx) — quadratic
+    /// time and memory on long fresh starts. Only the LAST chunk's output seeds the draft.
+    public func prefillFromTargetHidden(
+        inputIds: MLXArray, hidden: MLXArray, bonusToken: Int, prefillStep: Int = 256
+    ) {
         guard inputIds.dim(1) > 0 else { return }
         let bonus = MLXArray([Int32(bonusToken)]).reshaped([1, 1])
         let shifted = concatenated([inputIds[0..., 1...].asType(.int32), bonus], axis: 1)
-        let h = forwardTokens(shifted, hidden: hidden[0..., ..<shifted.dim(1), 0...])
-        setSeedFromHidden(lastStep(h))
+        let total = shifted.dim(1)
+        var start = 0
+        var lastChunkOut: MLXArray? = nil
+        while start < total {
+            let end = min(start + prefillStep, total)
+            let h = forwardTokens(
+                shifted[0..., start ..< end], hidden: hidden[0..., start ..< end, 0...])
+            eval(h)
+            lastChunkOut = h
+            start = end
+        }
+        if let h = lastChunkOut {
+            setSeedFromHidden(lastStep(h))
+        }
     }
 
     /// Draft `blockSize - 1` tokens greedily, starting from the carried seed.
@@ -382,7 +399,8 @@ extension Qwen35MTP {
         // On resume this EXTENDS the drafter cache: pairing starts at the suffix (the drafter
         // already holds pairs up to the session's last token) and re-seeds from the new end.
         drafter.prefillFromTargetHidden(
-            inputIds: suffixArr, hidden: suffixHidden, bonusToken: bonus)
+            inputIds: suffixArr, hidden: suffixHidden, bonusToken: bonus,
+            prefillStep: prefillStep)
 
         // The session now represents exactly the full prompt.
         session?.caches = targetCache
