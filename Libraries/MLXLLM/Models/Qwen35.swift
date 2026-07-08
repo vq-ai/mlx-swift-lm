@@ -295,16 +295,28 @@ final class Qwen35GatedDeltaNet: Module {
                 (out, state) = gatedDeltaUpdate(
                     q: qNormed, k: kNormed, v: v, a: a, b: b,
                     aLog: aLog, dtBias: dtBias, state: state, mask: mask)
+                // Independent LAZY prefix scans: steps[t] re-scans tokens 0...t in ONE kernel
+                // from initialState, so a rollback at index `acc` evaluates a single scan and
+                // materializes a single state buffer per layer. (The previous per-token CHAIN
+                // evaluated acc+1 kernels and materialized/retained acc+1 fp32 states per
+                // layer — the allocation churn dominated partial-acceptance rounds on-device.)
+                // Bit-identical: the scan kernel consumes tokens sequentially in fp32
+                // registers, so a T=t+1 scan ends in exactly the state the T=S scan passes
+                // through after t+1 tokens (the ops fallback iterates per token likewise).
+                // steps[S-1] IS the whole-block final state computed above — reuse it (free:
+                // it materializes with the verify eval as a sibling kernel output).
                 var ssmSteps: [MLXArray] = []
-                var running = initialState
                 for t in 0 ..< S {
-                    let maskT = mask == nil ? nil : mask![0..., t ..< (t + 1)]
+                    if t == S - 1, let finalState = state {
+                        ssmSteps.append(finalState)
+                        continue
+                    }
+                    let maskT = mask == nil ? nil : mask![0..., 0 ..< (t + 1)]
                     let (_, st) = gatedDeltaUpdate(
-                        q: qNormed[0..., t ..< (t + 1)], k: kNormed[0..., t ..< (t + 1)],
-                        v: v[0..., t ..< (t + 1)], a: a[0..., t ..< (t + 1)],
-                        b: b[0..., t ..< (t + 1)], aLog: aLog, dtBias: dtBias,
-                        state: running, mask: maskT)
-                    running = st
+                        q: qNormed[0..., 0 ..< (t + 1)], k: kNormed[0..., 0 ..< (t + 1)],
+                        v: v[0..., 0 ..< (t + 1)], a: a[0..., 0 ..< (t + 1)],
+                        b: b[0..., 0 ..< (t + 1)], aLog: aLog, dtBias: dtBias,
+                        state: initialState, mask: maskT)
                     ssmSteps.append(st)
                 }
                 cache?.capturedSSM = ssmSteps

@@ -78,4 +78,62 @@ public class GatedDeltaTests: XCTestCase {
         )
     }
 
+    /// A one-shot prefix scan (T = t+1) must end in EXACTLY the state a chained per-token
+    /// scan reaches after t+1 tokens, and the full-length prefix must equal the whole-scan
+    /// final state.
+    ///
+    /// This is the substitution the speculative-verify `.lazyRescan` capture relies on:
+    /// rollback states are computed as independent prefix scans (one kernel per layer)
+    /// instead of a sequential per-token chain. Both paths carry the recurrence in fp32
+    /// (registers in the kernel, stored state between chained calls), so they must agree
+    /// bit-for-bit — the emitted speculative tokens depend on it.
+    func testPrefixScanMatchesPerTokenChainExactly() throws {
+        let T = 6
+        let inputs = makeInputs(T: T)
+
+        // Chained per-token reference: state after each token, threading fp32 state.
+        var running: MLXArray? = nil
+        var chainStates: [MLXArray] = []
+        for t in 0 ..< T {
+            let (_, st) = gatedDeltaUpdate(
+                q: inputs.q[0..., t ..< (t + 1)], k: inputs.k[0..., t ..< (t + 1)],
+                v: inputs.v[0..., t ..< (t + 1)],
+                a: inputs.a[0..., t ..< (t + 1)], b: inputs.b[0..., t ..< (t + 1)],
+                aLog: inputs.aLog, dtBias: inputs.dtBias, state: running
+            )
+            running = st
+            chainStates.append(st)
+        }
+        eval(chainStates)
+
+        // Whole-scan final state (what the verify forward computes for the full block).
+        let (_, finalState) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias
+        )
+
+        for t in 0 ..< T {
+            let (_, prefixState) = gatedDeltaUpdate(
+                q: inputs.q[0..., ..<(t + 1)], k: inputs.k[0..., ..<(t + 1)],
+                v: inputs.v[0..., ..<(t + 1)],
+                a: inputs.a[0..., ..<(t + 1)], b: inputs.b[0..., ..<(t + 1)],
+                aLog: inputs.aLog, dtBias: inputs.dtBias
+            )
+            let diff = abs(prefixState.asType(.float32) - chainStates[t].asType(.float32))
+                .max().item(Float.self)
+            XCTAssertEqual(
+                diff, 0,
+                "Prefix scan T=\(t + 1) diverged from the per-token chain by \(diff) max abs. "
+                    + "Rollback states must be bit-identical to the sequential scan."
+            )
+        }
+
+        let finalDiff = abs(finalState.asType(.float32) - chainStates[T - 1].asType(.float32))
+            .max().item(Float.self)
+        XCTAssertEqual(
+            finalDiff, 0,
+            "Whole-scan final state diverged from the per-token chain by \(finalDiff) max abs."
+        )
+    }
+
 }

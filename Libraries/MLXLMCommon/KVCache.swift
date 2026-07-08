@@ -1400,8 +1400,9 @@ public class MambaCache: ArraysCache {
     /// When set (on a speculative MTP verify), the gated-delta layer records its conv state
     /// (`capturedConv`) and SSM recurrent state (`capturedSSM`) AFTER each token of the
     /// verify block, so a speculative rejection can roll the cache back to the accepted
-    /// position directly — no full-model re-forward. Captured via a per-token kernel scan, so
-    /// it is bit-identical to the normal (whole-block) path. Cleared each round.
+    /// position directly — no full-model re-forward. Captured either in-kernel
+    /// (`.kernelScan`) or as lazy one-kernel prefix scans (`.lazyRescan`); both are
+    /// bit-identical to the normal (whole-block) scan. Cleared each round.
     public var captureVerify = false
     public var capturedConv: [MLXArray] = []
     public var capturedSSM: [MLXArray] = []
