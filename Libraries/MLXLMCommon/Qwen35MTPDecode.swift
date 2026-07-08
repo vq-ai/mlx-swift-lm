@@ -105,24 +105,51 @@ public enum Qwen35MTP {
         return (draftTokens.count, Array(newTokens.prefix(max(0, budget))))
     }
 
-    /// Adaptive MTP block size — ported from mlx-vlm `_effective_mtp_block_size`
-    /// (speculative/mtp.py). Grows from the drafter's configured (trained) depth toward
-    /// `requestedBlock` only when the base depth's drafts are fully accepted often enough
-    /// (≥65% of recent rounds); otherwise the extra autoregressive draft steps just pay for
-    /// tokens that won't be accepted, so it stays at the base. `acceptLens` is the per-round
-    /// accepted-draft history; `remainingBudget` caps the block to the tokens left to emit.
+    /// Adaptive MTP block size — a marginal-depth staircase controller.
+    ///
+    /// Replaces the ported mlx-vlm `_effective_mtp_block_size` gate (≥65% full-base-block
+    /// hits → jump straight to the ceiling), which never grew in practice: 65% full-block
+    /// acceptance at depth 3 needs ~0.81 per-depth chain acceptance, far above the compute
+    /// break-even. Drafting one token deeper costs ~0.17-0.2 of a target forward (the MTP
+    /// head is small but shares the target's LM head), so the marginal depth pays for
+    /// itself while the chance the whole current block is accepted stays ≥ ~0.25.
+    ///
+    /// Rule: over the recent rounds, measure the FULL-BLOCK hit rate (accepted == proposed
+    /// drafts). ≥30% → grow ONE step (those rounds would each have had a shot at an extra
+    /// token); <20% → shrink one step (the deepest draft is mostly wasted compute); the
+    /// hysteresis band between avoids thrash and settles the depth where the marginal
+    /// full-block rate straddles break-even. Tool-call segments (hit rates 0.89-1.0) climb
+    /// to the ceiling in a few rounds; low-acceptance prose stays at the trained depth.
+    ///
+    /// `acceptLens`/`proposedLens` are the per-round accepted/proposed draft histories
+    /// (parallel arrays, carried across steps via the session); `remainingBudget` caps the
+    /// block to the tokens left to emit.
     public static func effectiveBlockSize(
-        requestedBlock: Int, configuredBlock: Int, acceptLens: [Int], remainingBudget: Int
+        requestedBlock: Int, configuredBlock: Int,
+        acceptLens: [Int], proposedLens: [Int], remainingBudget: Int
     ) -> Int {
         let blockTotal = min(requestedBlock, remainingBudget)
         let configured = min(configuredBlock, blockTotal)
         if blockTotal <= configured || configured <= 1 { return blockTotal }
-        if acceptLens.count < 8 { return configured }
-        let recent = acceptLens.suffix(12)  // short window: react fast at regime changes (tool-call <-> prose)
-        let configuredDraftCount = configured - 1
-        let hits = recent.filter { $0 >= configuredDraftCount }.count
-        let hitRate = Double(hits) / Double(recent.count)
-        return hitRate < 0.65 ? configured : blockTotal
+        guard acceptLens.count >= 8, acceptLens.count == proposedLens.count else {
+            return configured
+        }
+        // Short window: react fast at regime changes (tool-call <-> prose).
+        let window = 12
+        var hits = 0
+        var informative = 0
+        for (a, p) in zip(acceptLens.suffix(window), proposedLens.suffix(window)) where p > 0 {
+            informative += 1
+            if a >= p { hits += 1 }
+        }
+        guard informative >= 6 else { return configured }
+        let hitRate = Double(hits) / Double(informative)
+        // The staircase steps from the depth the last round actually ran (budget-clamped
+        // end-of-generation rounds are pulled back into [configured, blockTotal]).
+        let current = min(max((proposedLens.last ?? configured - 1) + 1, configured), blockTotal)
+        if hitRate >= 0.30 { return min(current + 1, blockTotal) }
+        if hitRate < 0.20 { return max(current - 1, configured) }
+        return current
     }
 
     /// A full snapshot of the target's cache stack, taken before a verify forward so the

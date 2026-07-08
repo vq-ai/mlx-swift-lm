@@ -52,55 +52,97 @@ struct Qwen35MTPDecodeTests {
         #expect(r.newTokens == [5, 6])
     }
 
-    // MARK: - Adaptive block size (ported from _effective_mtp_block_size)
+    // MARK: - Adaptive block size (marginal-depth staircase controller)
 
     @Test func adaptiveStaysAtBaseWithShortHistory() {
         // <8 rounds of history → don't grow yet, stay at the configured base.
         let bs = Qwen35MTP.effectiveBlockSize(
-            requestedBlock: 6, configuredBlock: 3, acceptLens: [2, 2, 2], remainingBudget: 100)
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: [2, 2, 2], proposedLens: [2, 2, 2], remainingBudget: 100)
         #expect(bs == 3)
     }
 
-    @Test func adaptiveGrowsWhenBaseFullyAccepted() {
-        // Recent rounds consistently accept the base draft-count (3-1=2) → grow to ceiling.
+    @Test func adaptiveGrowsOneStepNotToCeiling() {
+        // Sustained full acceptance at the base block (2/2 drafts) → grow ONE step (4),
+        // never jump straight to the ceiling — deeper depths must earn their own hits.
         let bs = Qwen35MTP.effectiveBlockSize(
             requestedBlock: 6, configuredBlock: 3,
-            acceptLens: Array(repeating: 2, count: 10), remainingBudget: 100)
+            acceptLens: Array(repeating: 2, count: 12),
+            proposedLens: Array(repeating: 2, count: 12), remainingBudget: 100)
+        #expect(bs == 4)
+    }
+
+    @Test func adaptiveClimbsFromTheDepthLastRun() {
+        // The staircase steps from the last round's depth: rounds at block 4 (3 drafts)
+        // fully accepted → grow to 5.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: [2, 2, 2, 2] + Array(repeating: 3, count: 8),
+            proposedLens: [2, 2, 2, 2] + Array(repeating: 3, count: 8), remainingBudget: 100)
+        #expect(bs == 5)
+    }
+
+    @Test func adaptiveCapsAtCeiling() {
+        // Already at the ceiling with perfect acceptance → stay there.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 5, count: 12),
+            proposedLens: Array(repeating: 5, count: 12), remainingBudget: 100)
         #expect(bs == 6)
     }
 
-    @Test func adaptiveStaysAtBaseWhenAcceptanceLow() {
-        // Base rarely fully accepted (<65%) → stay at base, don't waste draft steps.
+    @Test func adaptiveHoldsInHysteresisBand() {
+        // Full-block hit rate 3/12 = 0.25 ∈ [0.20, 0.30) at block 4 → hold the depth
+        // (marginal cost ≈ marginal yield; no thrash).
         let bs = Qwen35MTP.effectiveBlockSize(
             requestedBlock: 6, configuredBlock: 3,
-            acceptLens: Array(repeating: 0, count: 10), remainingBudget: 100)
+            acceptLens: [3, 3, 3] + Array(repeating: 1, count: 9),
+            proposedLens: Array(repeating: 3, count: 12), remainingBudget: 100)
+        #expect(bs == 4)
+    }
+
+    @Test func adaptiveShrinksOnLowHitRate() {
+        // Hit rate < 20% at block 4 → the deepest draft is wasted compute; step back to 3.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 0, count: 12),
+            proposedLens: Array(repeating: 3, count: 12), remainingBudget: 100)
         #expect(bs == 3)
     }
 
-    @Test func adaptiveHitRateBoundary() {
-        // The controller looks at the last 12 rounds (short window: reacts fast at tool-call ↔
-        // prose regime changes). 8/12 ≥ 65% → grow; 7/12 < 65% → stay. Older history (the
-        // leading zeros) must be ignored.
-        let grow = [Int](repeating: 0, count: 10) + [Int](repeating: 2, count: 8)
-        #expect(Qwen35MTP.effectiveBlockSize(
-            requestedBlock: 6, configuredBlock: 3, acceptLens: grow, remainingBudget: 100) == 6)
-        let stay = [Int](repeating: 0, count: 5) + [Int](repeating: 2, count: 7)
-        #expect(Qwen35MTP.effectiveBlockSize(
-            requestedBlock: 6, configuredBlock: 3, acceptLens: stay, remainingBudget: 100) == 3)
+    @Test func adaptiveNeverShrinksBelowConfigured() {
+        // Total rejection at the base block → still no lower than the configured depth.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 0, count: 12),
+            proposedLens: Array(repeating: 2, count: 12), remainingBudget: 100)
+        #expect(bs == 3)
     }
 
     @Test func adaptiveRespectsRemainingBudget() {
         // Budget caps the block even when acceptance is high.
         let bs = Qwen35MTP.effectiveBlockSize(
             requestedBlock: 6, configuredBlock: 3,
-            acceptLens: Array(repeating: 2, count: 10), remainingBudget: 4)
+            acceptLens: Array(repeating: 2, count: 12),
+            proposedLens: Array(repeating: 2, count: 12), remainingBudget: 4)
         #expect(bs == 4)
+    }
+
+    @Test func adaptiveIgnoresZeroDraftRounds() {
+        // Rounds that proposed no drafts carry no acceptance signal; if fewer than 6
+        // informative rounds remain in the window, stay at the base.
+        let bs = Qwen35MTP.effectiveBlockSize(
+            requestedBlock: 6, configuredBlock: 3,
+            acceptLens: Array(repeating: 0, count: 8) + [2, 2],
+            proposedLens: Array(repeating: 0, count: 8) + [2, 2], remainingBudget: 100)
+        #expect(bs == 3)
     }
 
     @Test func fixedBlockNoRoomToGrow() {
         // requested == configured (a fixed size) → just return it (capped by budget).
         #expect(Qwen35MTP.effectiveBlockSize(
-            requestedBlock: 3, configuredBlock: 3, acceptLens: [], remainingBudget: 100) == 3)
+            requestedBlock: 3, configuredBlock: 3,
+            acceptLens: [], proposedLens: [], remainingBudget: 100) == 3)
     }
 
     // MARK: - Stage 2: cache snapshot / restore (exact rollback on rejection)

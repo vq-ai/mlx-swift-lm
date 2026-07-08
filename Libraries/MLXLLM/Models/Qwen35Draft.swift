@@ -201,7 +201,14 @@ public final class Qwen35DraftModel: Module {
     }
 
     /// Strip the `mtp.` prefix and apply the Qwen3.5 RMSNorm `+1` weight convention.
+    ///
+    /// The `+1` shift applies ONLY to original combined checkpoints (drafter keys under
+    /// `mtp.`), whose norms are stored raw as `(1+w)` — the same guard the main model's
+    /// sanitize uses. Split/trained drafter dirs (mlx-vlm split.py, mtp_train.py) store
+    /// EFFECTIVE norm weights with unprefixed keys; shifting those again corrupts every
+    /// norm (measured: v3 acc@1 0.83→0.76 agentic, 0.61→0.48 prose; stock 0.68→0.44).
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let isOriginalCheckpoint = weights.keys.contains { $0.hasPrefix("mtp.") }
         let normSuffixes = [
             ".input_layernorm.weight", ".post_attention_layernorm.weight",
             ".q_norm.weight", ".k_norm.weight", "norm.weight",
@@ -212,7 +219,8 @@ public final class Qwen35DraftModel: Module {
             var k = k0
             if k.hasPrefix("mtp.") { k = String(k.dropFirst("mtp.".count)) }
             var v = v0
-            if v.ndim == 1, normSuffixes.contains(where: { k.hasSuffix($0) }) {
+            if isOriginalCheckpoint, v.ndim == 1,
+                normSuffixes.contains(where: { k.hasSuffix($0) }) {
                 v = v + MLXArray(Float(1)).asType(v.dtype)
             }
             out[k] = v
@@ -310,10 +318,12 @@ public final class Qwen35MTPSession {
     /// nil after an EOS end (everything emitted is already consumed). A resuming caller builds
     /// its next prompt as `tokens + [pendingFinalToken] + new-message tokens`.
     public internal(set) var pendingFinalToken: Int?
-    /// Accepted-draft history carried ACROSS steps: tool-call steps are short (~9 rounds), so a
-    /// per-generate history never reaches the adaptive controller's warm-up — carrying it lets
-    /// blocks grow where acceptance supports it (formulaic tool calls hit 89-100%).
+    /// Accepted/proposed-draft histories carried ACROSS steps: tool-call steps are short
+    /// (~9 rounds), so a per-generate history never reaches the adaptive controller's
+    /// warm-up — carrying them lets blocks grow where acceptance supports it (formulaic
+    /// tool calls hit 89-100%). Parallel arrays, one entry per speculation round.
     public internal(set) var acceptLens: [Int] = []
+    public internal(set) var proposedLens: [Int] = []
 
     public init() {}
 
@@ -535,7 +545,9 @@ extension Qwen35MTP {
         var accepted = 0
         var targetForwards = 0  // full-model forwards in the decode loop (verify + re-forwards)
         var rounds = 0
-        var acceptLens: [Int] = session?.acceptLens ?? []  // carried across steps via the session
+        // Carried across steps via the session (parallel per-round histories).
+        var acceptLens: [Int] = session?.acceptLens ?? []
+        var proposedLens: [Int] = session?.proposedLens ?? []
         // Adaptive grows from the drafter's trained depth toward `adaptiveCeiling`; each unit
         // of ceiling costs ~layers × 8.4 MB of verify-capture transient — cap it on-device.
         // Stream the first bonus token; `onTokens` returning false requests cancellation.
@@ -543,8 +555,8 @@ extension Qwen35MTP {
 
         while !cancelled && output.count < maxTokens && !eosTokens.contains(bonus) {
             // Effective block this round: a fixed `blockSize` if requested, else Adaptive —
-            // grow from the drafter's trained depth toward the ceiling only while recent rounds
-            // keep fully accepting the base depth (see `effectiveBlockSize`).
+            // a staircase from the drafter's trained depth toward the ceiling, stepping on
+            // the recent full-block hit rate (see `effectiveBlockSize`).
             let remaining = maxTokens - output.count
             let effBlock: Int
             if let bs = blockSize, bs > 0 {
@@ -552,7 +564,8 @@ extension Qwen35MTP {
             } else {
                 effBlock = effectiveBlockSize(
                     requestedBlock: adaptiveCeiling, configuredBlock: drafter.blockSize,
-                    acceptLens: acceptLens, remainingBudget: remaining)
+                    acceptLens: acceptLens, proposedLens: proposedLens,
+                    remainingBudget: remaining)
             }
             rounds += 1
             let draftArr = drafter.draftBlock(blockSize: effBlock)  // [1, effBlock-1]
@@ -604,7 +617,9 @@ extension Qwen35MTP {
             }
             accepted += acc
             acceptLens.append(acc)
+            proposedLens.append(draftTokens.count)
             session?.acceptLens = acceptLens
+            session?.proposedLens = proposedLens
             // Stop at the first EOS among the committed tokens. EOS can be an accepted *draft*
             // mid-block (not just the round's last token), so the `bonus`-only check misses it —
             // which is why generation ran past `<|im_end|>`. Emit up to (not including) EOS.
