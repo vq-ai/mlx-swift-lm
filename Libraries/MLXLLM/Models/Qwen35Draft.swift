@@ -306,11 +306,22 @@ extension Qwen35Model {
 /// states can't rewind, so resume is prefix-extension-only; any other prompt falls back to a
 /// fresh prefill (and re-primes this session). The drafter's cache rides along implicitly
 /// (same `Qwen35DraftModel` instance, not reset on resume) — pass the same drafter.
-/// How the speculative verify captures per-step gated-delta states for rollback.
-/// `unsafeNoCapture` is a BENCH PROBE ONLY: the verify runs with capture disarmed (measuring
-/// the true capture tax), and a rejected round keeps stale gated-delta states — the emitted
-/// stream is NOT exact after the first rejection. Never ship it.
-public enum Qwen35CaptureMode: Sendable { case kernelScan, lazyRescan, unsafeNoCapture }
+/// How the speculative verify prepares a rejected round's gated-delta rollback.
+/// - `.kernelScan` / `.lazyRescan` ARM per-step state capture on EVERY verify forward (a
+///   measured +60-115 ms/round on-device), so a rejection restores the captured state at the
+///   accepted index without any re-forward.
+/// - `.rejectReforward` runs every verify capture-free (the fast path) and pays only on
+///   REJECTED rounds: restore the retained pre-verify gated-delta refs, trim the
+///   full-attention caches, and re-forward the accepted prefix — rebuilding the states a
+///   capture would have selected (scan-of-prefix ≡ prefix-of-scan; identical math, equal
+///   up to kernel-shape scheduling like any block-vs-token forward). Memory-tight hosts
+///   (iPhone) should use this.
+/// - `.unsafeNoCapture` is a BENCH PROBE ONLY: the verify runs with capture disarmed
+///   (measuring the true capture tax), and a rejected round keeps stale gated-delta states —
+///   the emitted stream is NOT exact after the first rejection. Never ship it.
+public enum Qwen35CaptureMode: Sendable {
+    case kernelScan, lazyRescan, rejectReforward, unsafeNoCapture
+}
 
 public final class Qwen35MTPSession {
     public internal(set) var caches: [KVCache] = []
@@ -462,7 +473,7 @@ private struct Qwen35SampledVerifier {
 }
 
 extension Qwen35MTP {
-    /// Verify capture strategy — memory-tight hosts (iPhone) should use `.lazyRescan`.
+    /// Verify capture strategy — memory-tight hosts (iPhone) should use `.rejectReforward`.
     /// nonisolated(unsafe): set once at startup before any generation.
     public nonisolated(unsafe) static var captureMode: Qwen35CaptureMode = .kernelScan
 
@@ -593,12 +604,25 @@ extension Qwen35MTP {
             let verifyInput = [bonus] + draftTokens
             let verifyArr = MLXArray(verifyInput.map { Int32($0) })
                 .reshaped([1, verifyInput.count])
-            // Enable per-step capture on the gated-delta caches so a rejection rolls back
-            // without a re-forward. Read the true pre-verify offset from a full-attention
-            // cache (the gated-delta MambaCache does not track `offset` via `advance`).
+            // Read the true pre-verify offset from a full-attention cache (the gated-delta
+            // MambaCache does not track `offset` via `advance`).
             let preVerifyOffset = targetCache.compactMap { ($0 as? KVCacheSimple)?.offset }.first ?? 0
-            let capture = Qwen35MTP.captureMode != .unsafeNoCapture
+            // .kernelScan/.lazyRescan arm per-step capture on the gated-delta caches so a
+            // rejection rolls back without a re-forward — at a capture tax on EVERY verify.
+            // .rejectReforward and the probe run the verify capture-free (the fast path).
+            let capture: Bool
+            switch Qwen35MTP.captureMode {
+            case .kernelScan, .lazyRescan: capture = true
+            case .rejectReforward, .unsafeNoCapture: capture = false
+            }
             for c in targetCache { (c as? MambaCache)?.captureVerify = capture }
+            // .rejectReforward: retain the pre-verify gated-delta state refs, one pair per
+            // Mamba cache. MLX arrays are immutable and the layer REPLACES cache[0]/cache[1]
+            // on update, so holding the references is a free, already-materialized snapshot —
+            // only consulted when this round rejects (see `rollbackVerifiedCaches`).
+            let preVerifyStates: [(conv: MLXArray?, ssm: MLXArray?)] =
+                Qwen35MTP.captureMode == .rejectReforward
+                ? targetCache.compactMap { $0 as? MambaCache }.map { ($0[0], $0[1]) } : []
             targetForwards += 1
             let tVerify = CFAbsoluteTimeGetCurrent()
             let (verifyHidden, verifyLogits) = target.hiddenAndLogits(verifyArr, cache: targetCache)
@@ -661,22 +685,12 @@ extension Qwen35MTP {
                 // turn-close explicitly. The drafter skipped its round update (stale).
                 let keep = newToks.count  // tokens kept from the verify block, before EOS
                 if draftTokens.count - keep > 0 {
-                    let keepOffset = preVerifyOffset + keep + 1
-                    var selectedStates: [MLXArray] = []
-                    for c in targetCache {
-                        if let mamba = c as? MambaCache, !mamba.capturedConv.isEmpty {
-                            mamba[0] = mamba.capturedConv[keep]
-                            mamba[1] = mamba.capturedSSM[keep]
-                            (mamba as BaseKVCache).offset = keepOffset
-                            selectedStates.append(mamba.capturedConv[keep])
-                            selectedStates.append(mamba.capturedSSM[keep])
-                        } else if let mamba = c as? MambaCache {
-                            (mamba as BaseKVCache).offset = keepOffset
-                        } else if let base = c as? BaseKVCache, base.isTrimmable {
-                            _ = base.trim(draftTokens.count - keep)
-                        }
-                    }
-                    if !selectedStates.isEmpty { eval(selectedStates) }
+                    let tRollback = CFAbsoluteTimeGetCurrent()
+                    targetForwards += rollbackVerifiedCaches(
+                        target: target, targetCache: targetCache,
+                        preVerifyStates: preVerifyStates, preVerifyOffset: preVerifyOffset,
+                        verifyInput: verifyInput, keep: keep)
+                    rollbackSeconds += CFAbsoluteTimeGetCurrent() - tRollback
                 }
                 for c in targetCache {
                     guard let mamba = c as? MambaCache else { continue }
@@ -698,33 +712,15 @@ extension Qwen35MTP {
 
             // Roll back the target cache to EXACTLY [bonus] + accepted drafts — the correction
             // is the NEXT bonus and stays out of the cache. On full acceptance the cache already
-            // holds [bonus, all drafts]; otherwise, with NO re-forward: full-attention caches
-            // `trim` to the accepted offset, gated-delta caches restore the captured per-step
-            // conv + SSM state at index `acc` (the state after [bonus]+accepted drafts).
+            // holds [bonus, all drafts]; otherwise `rollbackVerifiedCaches` applies the
+            // mode's rollback (captured-state restore, accepted-prefix re-forward, or the
+            // probe's offset-only fixup).
             if acc < draftTokens.count {
                 let tRollback = CFAbsoluteTimeGetCurrent()
-                let keepOffset = preVerifyOffset + acc + 1
-                let drop = draftTokens.count - acc  // rejected drafts to drop from the verify block
-                var selectedStates: [MLXArray] = []
-                for c in targetCache {
-                    // Empty captures = unsafeNoCapture probe: fix the offset only and keep the
-                    // (stale) states — timing stays honest, the stream does not.
-                    if let mamba = c as? MambaCache, !mamba.capturedConv.isEmpty {
-                        mamba[0] = mamba.capturedConv[acc]
-                        mamba[1] = mamba.capturedSSM[acc]
-                        (mamba as BaseKVCache).offset = keepOffset
-                        selectedStates.append(mamba.capturedConv[acc])
-                        selectedStates.append(mamba.capturedSSM[acc])
-                    } else if let mamba = c as? MambaCache {
-                        (mamba as BaseKVCache).offset = keepOffset
-                    } else if let base = c as? BaseKVCache, base.isTrimmable {
-                        _ = base.trim(drop)
-                    }
-                }
-                // Materialize ONLY the selected rollback state (index `acc`) — one state per
-                // gated-delta layer instead of all K — cutting it loose from the verify graph
-                // before the captures are cleared. States past `acc` are never computed.
-                if !selectedStates.isEmpty { eval(selectedStates) }
+                targetForwards += rollbackVerifiedCaches(
+                    target: target, targetCache: targetCache,
+                    preVerifyStates: preVerifyStates, preVerifyOffset: preVerifyOffset,
+                    verifyInput: verifyInput, keep: acc)
                 rollbackSeconds += CFAbsoluteTimeGetCurrent() - tRollback
             }
             // Clear capture state for the next round.
@@ -754,5 +750,77 @@ extension Qwen35MTP {
             resumedSuffix: resuming ? suffixTokens.count : -1,
             draftSeconds: draftSeconds, verifySeconds: verifySeconds,
             rollbackSeconds: rollbackSeconds)
+    }
+
+    /// Roll the target caches back so they hold exactly `[round bonus] + the first `keep`
+    /// drafts` of the verify block, offset `preVerifyOffset + keep + 1`. Shared by the
+    /// rejected-round and mid-block-EOS paths; branches on the capture mode:
+    ///
+    /// - `.kernelScan` / `.lazyRescan`: gated-delta caches restore the captured per-step
+    ///   conv + SSM state at index `keep` (the state after [bonus] + kept drafts);
+    ///   full-attention caches `trim` the rejected tail. Only the SELECTED state is
+    ///   materialized — one per gated-delta layer instead of all K — cutting it loose from
+    ///   the verify graph before the captures are cleared; states past `keep` are never
+    ///   computed. Empty captures = the `.unsafeNoCapture` probe: fix the offset only and
+    ///   keep the (stale) states — timing stays honest, the stream does not.
+    /// - `.rejectReforward`: restore the retained pre-verify refs, trim the FULL verify
+    ///   block off the full-attention caches, and re-forward the kept prefix
+    ///   `[bonus] + drafts.prefix(keep)` capture-free. The scan kernel consumes tokens
+    ///   sequentially in fp32 registers, so scan-of-prefix ≡ prefix-of-scan — the rebuild
+    ///   recomputes the same states/KV a capture would have selected (identical math;
+    ///   measured ~1e-7 apart from re-projecting at a different block length, the same
+    ///   scheduling-noise class as block-vs-token decode — see Qwen35RejectReforwardTests).
+    ///   Its hidden output is NOT needed — the caller keeps using `verifyHidden` slices
+    ///   for the kept prefix.
+    ///
+    /// Returns the number of extra full-model target forwards performed (1 on
+    /// `.rejectReforward`, else 0) so the caller can count it in `targetForwards`.
+    static func rollbackVerifiedCaches(
+        target: Qwen35Model, targetCache: [KVCache],
+        preVerifyStates: [(conv: MLXArray?, ssm: MLXArray?)],
+        preVerifyOffset: Int, verifyInput: [Int], keep: Int
+    ) -> Int {
+        let keepOffset = preVerifyOffset + keep + 1
+        if Qwen35MTP.captureMode == .rejectReforward {
+            var mambaIdx = 0
+            for c in targetCache {
+                if let mamba = c as? MambaCache {
+                    let pre = preVerifyStates[mambaIdx]
+                    mambaIdx += 1
+                    mamba[0] = pre.conv
+                    mamba[1] = pre.ssm
+                } else if let base = c as? BaseKVCache, base.isTrimmable {
+                    _ = base.trim(verifyInput.count)  // the re-forward re-writes the kept prefix
+                }
+            }
+            let prefix = verifyInput.prefix(keep + 1).map { Int32($0) }
+            let prefixArr = MLXArray(Array(prefix)).reshaped([1, prefix.count])
+            let h = target.hidden(prefixArr, cache: targetCache)
+            eval(h)
+            // `ArraysCache.advance` does not track `offset` — pin it for cache/session
+            // parity with the capture modes' rollback.
+            for c in targetCache {
+                guard let mamba = c as? MambaCache else { continue }
+                (mamba as BaseKVCache).offset = keepOffset
+            }
+            return 1
+        }
+        let drop = verifyInput.count - 1 - keep  // rejected drafts to drop from the verify block
+        var selectedStates: [MLXArray] = []
+        for c in targetCache {
+            if let mamba = c as? MambaCache, !mamba.capturedConv.isEmpty {
+                mamba[0] = mamba.capturedConv[keep]
+                mamba[1] = mamba.capturedSSM[keep]
+                (mamba as BaseKVCache).offset = keepOffset
+                selectedStates.append(mamba.capturedConv[keep])
+                selectedStates.append(mamba.capturedSSM[keep])
+            } else if let mamba = c as? MambaCache {
+                (mamba as BaseKVCache).offset = keepOffset
+            } else if let base = c as? BaseKVCache, base.isTrimmable {
+                _ = base.trim(drop)
+            }
+        }
+        if !selectedStates.isEmpty { eval(selectedStates) }
+        return 0
     }
 }

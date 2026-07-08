@@ -277,7 +277,9 @@ final class Qwen35GatedDeltaNet: Module {
         var out: MLXArray
 
         if cache?.captureVerify == true {
-            // Speculative verify with per-step state capture for rollback. Two modes:
+            // Speculative verify with per-step state capture for rollback. Two modes reach
+            // here (.rejectReforward and the bench probe never arm captureVerify — they run
+            // the plain path below and rebuild state by re-forwarding the accepted prefix):
             // .kernelScan — the capture-variant kernel emits every post-token state from the
             //   single scan (fastest; materializes layers × K × stateSize per round — fine on
             //   Macs, too big for iPhone jetsam limits).
