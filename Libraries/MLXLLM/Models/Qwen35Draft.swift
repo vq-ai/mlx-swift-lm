@@ -346,6 +346,13 @@ public struct Qwen35MTPResult {
     public var rounds: Int = 0
     /// Resume telemetry: -1 = fresh prefill; otherwise the suffix length prefilled on resume.
     public var resumedSuffix: Int = -1
+    /// Per-phase wall time across the decode loop, attributed at the three sync barriers:
+    /// `draft` = draftBlock + its asArray sync (also realizes the previous round's re-commit
+    /// graph), `verify` = target forward + its eval, `rollback` = cache rollback + its eval
+    /// (partial rounds only). The remainder of decode time is walk/bookkeeping/streaming.
+    public var draftSeconds: Double = 0
+    public var verifySeconds: Double = 0
+    public var rollbackSeconds: Double = 0
 }
 
 /// Draws the per-round sampling outcomes for the sampled speculative verify.
@@ -545,6 +552,11 @@ extension Qwen35MTP {
         var accepted = 0
         var targetForwards = 0  // full-model forwards in the decode loop (verify + re-forwards)
         var rounds = 0
+        // Per-phase wall clocks (see Qwen35MTPResult) — each phase ends at its sync barrier,
+        // so lazy graph cost lands on the phase that forces it.
+        var draftSeconds = 0.0
+        var verifySeconds = 0.0
+        var rollbackSeconds = 0.0
         // Carried across steps via the session (parallel per-round histories).
         var acceptLens: [Int] = session?.acceptLens ?? []
         var proposedLens: [Int] = session?.proposedLens ?? []
@@ -568,8 +580,10 @@ extension Qwen35MTP {
                     remainingBudget: remaining)
             }
             rounds += 1
+            let tDraft = CFAbsoluteTimeGetCurrent()
             let draftArr = drafter.draftBlock(blockSize: effBlock)  // [1, effBlock-1]
             let draftTokens = draftArr.asArray(Int32.self).map { Int($0) }
+            draftSeconds += CFAbsoluteTimeGetCurrent() - tDraft
             proposed += draftTokens.count
 
             // Verify [bonus, draft_0 .. draft_{K-2}] in one forward (advances target cache by K).
@@ -582,6 +596,7 @@ extension Qwen35MTP {
             let preVerifyOffset = targetCache.compactMap { ($0 as? KVCacheSimple)?.offset }.first ?? 0
             for c in targetCache { (c as? MambaCache)?.captureVerify = true }
             targetForwards += 1
+            let tVerify = CFAbsoluteTimeGetCurrent()
             let (verifyHidden, verifyLogits) = target.hiddenAndLogits(verifyArr, cache: targetCache)
             let budget = maxTokens - output.count
             let acc: Int
@@ -599,6 +614,7 @@ extension Qwen35MTP {
                 let outcome = verifier.outcomes(
                     verifyLogits: verifyLogits, draftTokens: draftTokens, ringRows: ringRows)
                 eval(verifyHidden)
+                verifySeconds += CFAbsoluteTimeGetCurrent() - tVerify
                 (acc, newToksRaw) = speculativeWalkSampled(
                     draftTokens: draftTokens, pDraft: outcome.pDraft,
                     uniforms: outcome.uniforms, residualSamples: outcome.residual,
@@ -611,6 +627,7 @@ extension Qwen35MTP {
                 // ever being computed).
                 let targetPredsArr = argMax(verifyLogits, axis: -1).asType(.int32)
                 eval(verifyHidden, targetPredsArr)
+                verifySeconds += CFAbsoluteTimeGetCurrent() - tVerify
                 let targetPreds = targetPredsArr.asArray(Int32.self).map { Int($0) }
                 (acc, newToksRaw) = speculativeWalk(
                     draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
@@ -679,6 +696,7 @@ extension Qwen35MTP {
             // `trim` to the accepted offset, gated-delta caches restore the captured per-step
             // conv + SSM state at index `acc` (the state after [bonus]+accepted drafts).
             if acc < draftTokens.count {
+                let tRollback = CFAbsoluteTimeGetCurrent()
                 let keepOffset = preVerifyOffset + acc + 1
                 let drop = draftTokens.count - acc  // rejected drafts to drop from the verify block
                 var selectedStates: [MLXArray] = []
@@ -697,6 +715,7 @@ extension Qwen35MTP {
                 // gated-delta layer instead of all K — cutting it loose from the verify graph
                 // before the captures are cleared. States past `acc` are never computed.
                 if !selectedStates.isEmpty { eval(selectedStates) }
+                rollbackSeconds += CFAbsoluteTimeGetCurrent() - tRollback
             }
             // Clear capture state for the next round.
             for c in targetCache {
@@ -722,6 +741,8 @@ extension Qwen35MTP {
         return Qwen35MTPResult(
             tokens: Array(output.prefix(maxTokens)), proposed: proposed, accepted: accepted,
             targetForwards: targetForwards, rounds: rounds,
-            resumedSuffix: resuming ? suffixTokens.count : -1)
+            resumedSuffix: resuming ? suffixTokens.count : -1,
+            draftSeconds: draftSeconds, verifySeconds: verifySeconds,
+            rollbackSeconds: rollbackSeconds)
     }
 }
