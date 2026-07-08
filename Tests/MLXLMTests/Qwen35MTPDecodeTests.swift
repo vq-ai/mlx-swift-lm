@@ -92,11 +92,11 @@ struct Qwen35MTPDecodeTests {
     }
 
     @Test func adaptiveHoldsInHysteresisBand() {
-        // Full-block hit rate 3/12 = 0.25 ∈ [0.20, 0.30) at block 4 → hold the depth
+        // Full-block hit rate 5/12 ≈ 0.42 ∈ [0.35, 0.45) at block 4 → hold the depth
         // (marginal cost ≈ marginal yield; no thrash).
         let bs = Qwen35MTP.effectiveBlockSize(
             requestedBlock: 6, configuredBlock: 3,
-            acceptLens: [3, 3, 3] + Array(repeating: 1, count: 9),
+            acceptLens: Array(repeating: 3, count: 5) + Array(repeating: 1, count: 7),
             proposedLens: Array(repeating: 3, count: 12), remainingBudget: 100)
         #expect(bs == 4)
     }

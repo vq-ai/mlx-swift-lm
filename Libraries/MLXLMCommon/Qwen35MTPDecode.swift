@@ -115,11 +115,14 @@ public enum Qwen35MTP {
     /// itself while the chance the whole current block is accepted stays ≥ ~0.25.
     ///
     /// Rule: over the recent rounds, measure the FULL-BLOCK hit rate (accepted == proposed
-    /// drafts). ≥30% → grow ONE step (those rounds would each have had a shot at an extra
-    /// token); <20% → shrink one step (the deepest draft is mostly wasted compute); the
-    /// hysteresis band between avoids thrash and settles the depth where the marginal
-    /// full-block rate straddles break-even. Tool-call segments (hit rates 0.89-1.0) climb
-    /// to the ceiling in a few rounds; low-acceptance prose stays at the trained depth.
+    /// drafts). ≥45% → grow ONE step; <35% → shrink one step; the hysteresis band between
+    /// avoids thrash and settles the depth where the marginal full-block rate straddles
+    /// break-even. Thresholds are calibrated to the measured device profile (verify ~115 ms,
+    /// draft step ~21 ms, rollback ~40 ms on partially-accepted rounds): throughput-equal
+    /// hit rates for K→K+1 sit at ~0.42-0.48 across K=3..6 — and the marginal token only
+    /// lands with probability h·q (full-block hit AND the next draft accepted), not h.
+    /// Tool-call segments (hit rates 0.89-1.0) still climb to the ceiling in a few rounds;
+    /// low-acceptance prose stays at the trained depth.
     ///
     /// `acceptLens`/`proposedLens` are the per-round accepted/proposed draft histories
     /// (parallel arrays, carried across steps via the session); `remainingBudget` caps the
@@ -147,8 +150,8 @@ public enum Qwen35MTP {
         // The staircase steps from the depth the last round actually ran (budget-clamped
         // end-of-generation rounds are pulled back into [configured, blockTotal]).
         let current = min(max((proposedLens.last ?? configured - 1) + 1, configured), blockTotal)
-        if hitRate >= 0.30 { return min(current + 1, blockTotal) }
-        if hitRate < 0.20 { return max(current - 1, configured) }
+        if hitRate >= 0.45 { return min(current + 1, blockTotal) }
+        if hitRate < 0.35 { return max(current - 1, configured) }
         return current
     }
 
