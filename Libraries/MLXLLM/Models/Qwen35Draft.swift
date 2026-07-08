@@ -307,7 +307,10 @@ extension Qwen35Model {
 /// fresh prefill (and re-primes this session). The drafter's cache rides along implicitly
 /// (same `Qwen35DraftModel` instance, not reset on resume) — pass the same drafter.
 /// How the speculative verify captures per-step gated-delta states for rollback.
-public enum Qwen35CaptureMode: Sendable { case kernelScan, lazyRescan }
+/// `unsafeNoCapture` is a BENCH PROBE ONLY: the verify runs with capture disarmed (measuring
+/// the true capture tax), and a rejected round keeps stale gated-delta states — the emitted
+/// stream is NOT exact after the first rejection. Never ship it.
+public enum Qwen35CaptureMode: Sendable { case kernelScan, lazyRescan, unsafeNoCapture }
 
 public final class Qwen35MTPSession {
     public internal(set) var caches: [KVCache] = []
@@ -594,7 +597,8 @@ extension Qwen35MTP {
             // without a re-forward. Read the true pre-verify offset from a full-attention
             // cache (the gated-delta MambaCache does not track `offset` via `advance`).
             let preVerifyOffset = targetCache.compactMap { ($0 as? KVCacheSimple)?.offset }.first ?? 0
-            for c in targetCache { (c as? MambaCache)?.captureVerify = true }
+            let capture = Qwen35MTP.captureMode != .unsafeNoCapture
+            for c in targetCache { (c as? MambaCache)?.captureVerify = capture }
             targetForwards += 1
             let tVerify = CFAbsoluteTimeGetCurrent()
             let (verifyHidden, verifyLogits) = target.hiddenAndLogits(verifyArr, cache: targetCache)
@@ -660,12 +664,14 @@ extension Qwen35MTP {
                     let keepOffset = preVerifyOffset + keep + 1
                     var selectedStates: [MLXArray] = []
                     for c in targetCache {
-                        if let mamba = c as? MambaCache {
+                        if let mamba = c as? MambaCache, !mamba.capturedConv.isEmpty {
                             mamba[0] = mamba.capturedConv[keep]
                             mamba[1] = mamba.capturedSSM[keep]
                             (mamba as BaseKVCache).offset = keepOffset
                             selectedStates.append(mamba.capturedConv[keep])
                             selectedStates.append(mamba.capturedSSM[keep])
+                        } else if let mamba = c as? MambaCache {
+                            (mamba as BaseKVCache).offset = keepOffset
                         } else if let base = c as? BaseKVCache, base.isTrimmable {
                             _ = base.trim(draftTokens.count - keep)
                         }
@@ -701,12 +707,16 @@ extension Qwen35MTP {
                 let drop = draftTokens.count - acc  // rejected drafts to drop from the verify block
                 var selectedStates: [MLXArray] = []
                 for c in targetCache {
-                    if let mamba = c as? MambaCache {
+                    // Empty captures = unsafeNoCapture probe: fix the offset only and keep the
+                    // (stale) states — timing stays honest, the stream does not.
+                    if let mamba = c as? MambaCache, !mamba.capturedConv.isEmpty {
                         mamba[0] = mamba.capturedConv[acc]
                         mamba[1] = mamba.capturedSSM[acc]
                         (mamba as BaseKVCache).offset = keepOffset
                         selectedStates.append(mamba.capturedConv[acc])
                         selectedStates.append(mamba.capturedSSM[acc])
+                    } else if let mamba = c as? MambaCache {
+                        (mamba as BaseKVCache).offset = keepOffset
                     } else if let base = c as? BaseKVCache, base.isTrimmable {
                         _ = base.trim(drop)
                     }
