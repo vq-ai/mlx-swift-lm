@@ -367,6 +367,187 @@ public struct Qwen35MTPResult {
     public var draftSeconds: Double = 0
     public var verifySeconds: Double = 0
     public var rollbackSeconds: Double = 0
+
+    // MARK: Per-round memory telemetry (retention-tax instrumentation)
+    //
+    // Sampled at the SAME sync barriers as the phase clocks above, as pure reads of the
+    // Metal allocator's counters (`Memory.activeMemory`/`cacheMemory`/`peakMemory` are
+    // plain size_t loads — no lock, no eval, no GPU sync; the per-round peak reset takes
+    // only the allocator mutex). All values in MB; 0 = not measured (loop never ran).
+    //
+    // "Fresh" is the wiring-hypothesis money metric: MLX recycles buffers through a pool,
+    // and `active + cache` stays CONSTANT while requests are served from the pool (reuse
+    // moves bytes cache→active, free moves them back). The total only GROWS when the
+    // allocator must create a new MTLBuffer — exactly the fresh wiring the retention-tax
+    // hypothesis blames for the state-retaining modes' verify cost — and only SHRINKS when
+    // buffers are truly released to the system (cache purge under pressure / GC inside
+    // malloc). Positive inter-sample deltas of the total are attributed to the phase that
+    // forced them.
+
+    /// Active (in-use) MLX memory right before the draft phase, avg/max over rounds.
+    public var memActiveBeforeDraftAvgMB: Double = 0
+    public var memActiveBeforeDraftMaxMB: Double = 0
+    /// Active memory right after the verify eval barrier.
+    public var memActiveAfterVerifyAvgMB: Double = 0
+    public var memActiveAfterVerifyMaxMB: Double = 0
+    /// Active memory after the rollback block (sampled every round, rollback or not).
+    public var memActiveAfterRollbackAvgMB: Double = 0
+    public var memActiveAfterRollbackMaxMB: Double = 0
+    /// Buffer-pool (recyclable) memory at the same three points, avg over rounds.
+    public var memCacheBeforeDraftAvgMB: Double = 0
+    public var memCacheAfterVerifyAvgMB: Double = 0
+    public var memCacheAfterRollbackAvgMB: Double = 0
+    /// Per-round high-water mark of active memory. Requires
+    /// ``Qwen35MTP/memoryTelemetryResetsPeak`` (resets the program-global peak counter at
+    /// each round start); 0 when disabled.
+    public var memPeakRoundAvgMB: Double = 0
+    public var memPeakRoundMaxMB: Double = 0
+    /// Decode-loop high-water mark minus active at loop entry — the headroom the loop
+    /// itself needs beyond the standing state (weights + caches + retained refs).
+    public var memPeakDecodeGrowthMB: Double = 0
+    /// Fresh bytes obtained from Metal per round (positive Δ(active+cache) between
+    /// consecutive samples). Rounds that recycle perfectly report ~0; the wiring
+    /// hypothesis predicts ~verify-workspace-sized values EVERY round in the
+    /// state-retaining modes.
+    public var memFreshRoundAvgMB: Double = 0
+    public var memFreshRoundMaxMB: Double = 0
+    /// The verify phase's share of the round's fresh bytes (after-draft → after-verify).
+    public var memFreshVerifyRoundAvgMB: Double = 0
+    public var memFreshVerifyRoundMaxMB: Double = 0
+    /// Total fresh bytes across the decode loop (== `memFreshRoundAvgMB` × `rounds`).
+    public var memFreshTotalMB: Double = 0
+    /// Bytes truly released back to the system during decode (cache purges under memory
+    /// pressure / GC inside malloc). Nonzero means the pool is torn down mid-loop, forcing
+    /// later rounds to wire fresh buffers again — the churn signature.
+    public var memReleasedTotalMB: Double = 0
+}
+
+/// Per-round allocator-counter sampler behind ``Qwen35MTPResult``'s memory telemetry.
+///
+/// Every read is a plain load of the Metal allocator's counters — no lock, no eval, no GPU
+/// sync (`GPU.resetPeakMemory()` alone takes the allocator mutex; still trivially cheap).
+/// Samples land at the same sync barriers as the phase clocks, so the counters reflect
+/// exactly what the just-synced phase left allocated.
+private struct Qwen35DecodeMemorySampler {
+    private static let bytesPerMB = 1024.0 * 1024.0
+
+    private let resetPeakPerRound: Bool
+    private var rounds = 0
+    private let activeAtLoopStartMB: Double
+    private var decodePeakMB: Double
+    private var lastTotalMB: Double
+
+    // Per-point accumulators, indexed by Point.rawValue.
+    private var activeSumMB = [0.0, 0.0, 0.0]
+    private var activeMaxMB = [0.0, 0.0, 0.0]
+    private var cacheSumMB = [0.0, 0.0, 0.0]
+
+    private var peakRoundSumMB = 0.0
+    private var peakRoundMaxMB = 0.0
+
+    private var freshRoundMB = 0.0
+    private var freshVerifyRoundMB = 0.0
+    private var freshRoundSumMB = 0.0
+    private var freshRoundMaxMB = 0.0
+    private var freshVerifySumMB = 0.0
+    private var freshVerifyMaxMB = 0.0
+    private var releasedTotalMB = 0.0
+
+    enum Point: Int { case beforeDraft = 0, afterVerify = 1, afterRollback = 2 }
+
+    /// The two allocator counters, in MB. Plain loads — safe at any point in the loop.
+    private static func countersMB() -> (active: Double, cache: Double) {
+        (Double(Memory.activeMemory) / bytesPerMB, Double(Memory.cacheMemory) / bytesPerMB)
+    }
+
+    init(resetPeakPerRound: Bool) {
+        self.resetPeakPerRound = resetPeakPerRound
+        let (active, cache) = Self.countersMB()
+        self.activeAtLoopStartMB = active
+        self.decodePeakMB = active
+        self.lastTotalMB = active + cache
+    }
+
+    /// Start a round: reset the (program-global) peak counter so ``roundEnd()`` reads a
+    /// per-round high-water mark, then take the before-draft sample.
+    mutating func roundBegin() {
+        rounds += 1
+        freshRoundMB = 0
+        freshVerifyRoundMB = 0
+        if resetPeakPerRound { GPU.resetPeakMemory() }
+        sample(.beforeDraft)
+    }
+
+    /// After the draft sync barrier — feeds only the fresh-delta chain (the draft phase
+    /// also realizes the previous round's drafter re-commit graph), isolating the verify
+    /// phase's fresh bytes from the draft's.
+    mutating func afterDraftSync() {
+        let (active, cache) = Self.countersMB()
+        advanceTotal(active: active, cache: cache, verifyPhase: false)
+    }
+
+    mutating func sample(_ point: Point) {
+        let (active, cache) = Self.countersMB()
+        let i = point.rawValue
+        activeSumMB[i] += active
+        activeMaxMB[i] = max(activeMaxMB[i], active)
+        cacheSumMB[i] += cache
+        decodePeakMB = max(decodePeakMB, active)
+        advanceTotal(active: active, cache: cache, verifyPhase: point == .afterVerify)
+    }
+
+    private mutating func advanceTotal(active: Double, cache: Double, verifyPhase: Bool) {
+        let total = active + cache
+        let delta = total - lastTotalMB
+        lastTotalMB = total
+        if delta > 0 {
+            freshRoundMB += delta
+            if verifyPhase { freshVerifyRoundMB += delta }
+        } else {
+            releasedTotalMB -= delta
+        }
+    }
+
+    /// Close the round (after the after-rollback sample): fold the per-round peak and
+    /// fresh accumulators.
+    mutating func roundEnd() {
+        if resetPeakPerRound {
+            let peak = Double(Memory.peakMemory) / Self.bytesPerMB
+            peakRoundSumMB += peak
+            peakRoundMaxMB = max(peakRoundMaxMB, peak)
+            decodePeakMB = max(decodePeakMB, peak)
+        }
+        freshRoundSumMB += freshRoundMB
+        freshRoundMaxMB = max(freshRoundMaxMB, freshRoundMB)
+        freshVerifySumMB += freshVerifyRoundMB
+        freshVerifyMaxMB = max(freshVerifyMaxMB, freshVerifyRoundMB)
+    }
+
+    /// Write the accumulated telemetry into the result. No-op when no round completed.
+    func write(into result: inout Qwen35MTPResult) {
+        guard rounds > 0 else { return }
+        let n = Double(rounds)
+        result.memActiveBeforeDraftAvgMB = activeSumMB[0] / n
+        result.memActiveBeforeDraftMaxMB = activeMaxMB[0]
+        result.memActiveAfterVerifyAvgMB = activeSumMB[1] / n
+        result.memActiveAfterVerifyMaxMB = activeMaxMB[1]
+        result.memActiveAfterRollbackAvgMB = activeSumMB[2] / n
+        result.memActiveAfterRollbackMaxMB = activeMaxMB[2]
+        result.memCacheBeforeDraftAvgMB = cacheSumMB[0] / n
+        result.memCacheAfterVerifyAvgMB = cacheSumMB[1] / n
+        result.memCacheAfterRollbackAvgMB = cacheSumMB[2] / n
+        if resetPeakPerRound {
+            result.memPeakRoundAvgMB = peakRoundSumMB / n
+            result.memPeakRoundMaxMB = peakRoundMaxMB
+        }
+        result.memPeakDecodeGrowthMB = max(0, decodePeakMB - activeAtLoopStartMB)
+        result.memFreshRoundAvgMB = freshRoundSumMB / n
+        result.memFreshRoundMaxMB = freshRoundMaxMB
+        result.memFreshVerifyRoundAvgMB = freshVerifySumMB / n
+        result.memFreshVerifyRoundMaxMB = freshVerifyMaxMB
+        result.memFreshTotalMB = freshRoundSumMB
+        result.memReleasedTotalMB = releasedTotalMB
+    }
 }
 
 /// Draws the per-round sampling outcomes for the sampled speculative verify.
@@ -477,6 +658,14 @@ extension Qwen35MTP {
     /// nonisolated(unsafe): set once at startup before any generation.
     public nonisolated(unsafe) static var captureMode: Qwen35CaptureMode = .kernelScan
 
+    /// Whether the decode loop's memory telemetry resets the program-global
+    /// `GPU.peakMemory` counter at each round start so `Qwen35MTPResult.memPeakRound*`
+    /// report true per-round high-water marks. Costs one allocator-mutex acquisition per
+    /// round but CLOBBERS the global peak for any outer observer — hosts that track a
+    /// process-wide peak across a generate should disable it (the per-round peak fields
+    /// then stay 0). nonisolated(unsafe): set once at startup before any generation.
+    public nonisolated(unsafe) static var memoryTelemetryResetsPeak = true
+
     /// MTP self-speculative decode. With `sampling == nil` it is exact GREEDY: the emitted
     /// token ids are identical to plain greedy decode of the target. With `sampling` set it
     /// is exact SAMPLED: the emitted stream is a true sample from the same
@@ -571,6 +760,10 @@ extension Qwen35MTP {
         var draftSeconds = 0.0
         var verifySeconds = 0.0
         var rollbackSeconds = 0.0
+        // Per-round allocator-counter sampling at the same barriers as the phase clocks
+        // (see Qwen35MTPResult's memory fields) — pure counter reads, trivial overhead.
+        var memSampler = Qwen35DecodeMemorySampler(
+            resetPeakPerRound: Qwen35MTP.memoryTelemetryResetsPeak)
         // Carried across steps via the session (parallel per-round histories).
         var acceptLens: [Int] = session?.acceptLens ?? []
         var proposedLens: [Int] = session?.proposedLens ?? []
@@ -594,10 +787,12 @@ extension Qwen35MTP {
                     remainingBudget: remaining)
             }
             rounds += 1
+            memSampler.roundBegin()
             let tDraft = CFAbsoluteTimeGetCurrent()
             let draftArr = drafter.draftBlock(blockSize: effBlock)  // [1, effBlock-1]
             let draftTokens = draftArr.asArray(Int32.self).map { Int($0) }
             draftSeconds += CFAbsoluteTimeGetCurrent() - tDraft
+            memSampler.afterDraftSync()
             proposed += draftTokens.count
 
             // Verify [bonus, draft_0 .. draft_{K-2}] in one forward (advances target cache by K).
@@ -660,6 +855,7 @@ extension Qwen35MTP {
                 (acc, newToksRaw) = speculativeWalk(
                     draftTokens: draftTokens, targetTokens: targetPreds, budget: budget)
             }
+            memSampler.sample(.afterVerify)
             accepted += acc
             acceptLens.append(acc)
             proposedLens.append(draftTokens.count)
@@ -692,6 +888,8 @@ extension Qwen35MTP {
                         verifyInput: verifyInput, keep: keep)
                     rollbackSeconds += CFAbsoluteTimeGetCurrent() - tRollback
                 }
+                memSampler.sample(.afterRollback)
+                memSampler.roundEnd()
                 for c in targetCache {
                     guard let mamba = c as? MambaCache else { continue }
                     mamba.captureVerify = false
@@ -723,6 +921,8 @@ extension Qwen35MTP {
                     verifyInput: verifyInput, keep: acc)
                 rollbackSeconds += CFAbsoluteTimeGetCurrent() - tRollback
             }
+            memSampler.sample(.afterRollback)
+            memSampler.roundEnd()
             // Clear capture state for the next round.
             for c in targetCache {
                 guard let mamba = c as? MambaCache else { continue }
@@ -744,12 +944,14 @@ extension Qwen35MTP {
             bonus = newToks.last ?? bonus
         }
 
-        return Qwen35MTPResult(
+        var result = Qwen35MTPResult(
             tokens: Array(output.prefix(maxTokens)), proposed: proposed, accepted: accepted,
             targetForwards: targetForwards, rounds: rounds,
             resumedSuffix: resuming ? suffixTokens.count : -1,
             draftSeconds: draftSeconds, verifySeconds: verifySeconds,
             rollbackSeconds: rollbackSeconds)
+        memSampler.write(into: &result)
+        return result
     }
 
     /// Roll the target caches back so they hold exactly `[round bonus] + the first `keep`
