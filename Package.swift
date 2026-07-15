@@ -36,7 +36,11 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
+        // vq-ai/mlx-swift branch prism-1bit: upstream 0.31.6 core + PrismML 1-bit affine Metal
+        // kernels (bits:1 dispatches through QuantizedLinear — no Swift API change) so the app can
+        // run 1-bit models like Bonsai-27B. All our Qwen3.5 MTP work lives here in mlx-swift-lm and
+        // is unaffected; 4-bit models (the 9B) are unchanged. Branch pin, not a version range.
+        .package(url: "https://github.com/vq-ai/mlx-swift", branch: "prism-1bit"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
