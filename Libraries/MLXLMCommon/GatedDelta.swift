@@ -9,6 +9,25 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Selects the differentiable ops implementation for gradient-bearing work without changing the
+/// inference default. The fused Metal scan intentionally has no VJP and remains the fast path
+/// outside this task-local scope.
+public enum GatedDeltaExecutionContext {
+    @TaskLocal static var requiresDifferentiableOperations = false
+
+    public static func withDifferentiableOperations<Result>(
+        _ operation: () throws -> Result
+    ) rethrows -> Result {
+        try $requiresDifferentiableOperations.withValue(true, operation: operation)
+    }
+
+    public static func withDifferentiableOperations<Result>(
+        _ operation: () async throws -> Result
+    ) async rethrows -> Result {
+        try await $requiresDifferentiableOperations.withValue(true, operation: operation)
+    }
+}
+
 // MARK: - Compute G
 
 // Fused via compile() to collapse the exp/exp/softplus/mul chain into one dispatch — Swift's
@@ -382,7 +401,9 @@ public func gatedDeltaUpdate(
         state = state.asType(.float32)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    if !GatedDeltaExecutionContext.requiresDifferentiableOperations,
+        GatedDeltaKernelManager.shared.kernel != nil
+    {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 
@@ -418,7 +439,9 @@ public func gatedDeltaUpdateCaptured(
         state = state.asType(.float32)
     }
 
-    if GatedDeltaKernelManager.shared.kernelCapture != nil {
+    if !GatedDeltaExecutionContext.requiresDifferentiableOperations,
+        GatedDeltaKernelManager.shared.kernelCapture != nil
+    {
         let (y, final, statesAll) = gatedDeltaKernelCaptured(
             q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
         // Per-step views into the packed buffer; `contiguous` cuts a kept slice loose from the

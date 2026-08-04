@@ -136,4 +136,26 @@ public class GatedDeltaTests: XCTestCase {
         )
     }
 
+    /// Training must bypass the inference-only Metal scan, whose primitive has no VJP.
+    func testDifferentiableExecutionSupportsGradient() throws {
+        let inputs = makeInputs(T: 2, Hk: 1, Dk: 32, Hv: 1, Dv: 2)
+
+        let gradient = GatedDeltaExecutionContext.withDifferentiableOperations {
+            grad { query in
+                gatedDeltaUpdate(
+                    q: query, k: inputs.k, v: inputs.v,
+                    a: inputs.a, b: inputs.b,
+                    aLog: inputs.aLog, dtBias: inputs.dtBias
+                ).0.sum()
+            }(inputs.q)
+        }
+        eval(gradient)
+
+        XCTAssertEqual(gradient.shape, inputs.q.shape)
+        XCTAssertTrue(
+            gradient.asArray(Float.self).allSatisfy { $0.isFinite },
+            "Differentiable gated-delta fallback produced a non-finite gradient."
+        )
+    }
+
 }
