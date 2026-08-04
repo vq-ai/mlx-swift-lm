@@ -2,8 +2,9 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
 import XCTest
+
+@testable import MLXLMCommon
 
 public class GatedDeltaTests: XCTestCase {
 
@@ -156,6 +157,77 @@ public class GatedDeltaTests: XCTestCase {
             gradient.asArray(Float.self).allSatisfy { $0.isFinite },
             "Differentiable gated-delta fallback produced a non-finite gradient."
         )
+    }
+
+    /// The fused training primitive must remain gradient-equivalent to the transparent ops scan.
+    /// This covers GQA head reduction and the recurrent-state cotangent, not just the output path.
+    func testFusedTrainingGradientMatchesOpsReference() throws {
+        let inputs = makeInputs(T: 5, Hk: 1, Dk: 32, Hv: 2, Dv: 4)
+        let state = MLXRandom.normal([1, 2, 4, 32]).asType(.float32)
+        let g = computeGatedDeltaG(inputs.aLog, inputs.a, inputs.dtBias)
+        let beta = sigmoid(inputs.b).asType(.float32)
+        let primals = [
+            state, inputs.q.asType(.float32), inputs.k.asType(.float32),
+            inputs.v.asType(.float32), g, beta,
+        ]
+
+        func loss(_ output: (MLXArray, MLXArray)) -> [MLXArray] {
+            [
+                (output.0.asType(.float32).square().mean()
+                    + MLXArray(0.1) * output.1.square().mean())
+            ]
+        }
+
+        let (_, reference) = vjp(
+            { values in
+                loss(
+                    gatedDeltaOps(
+                        q: values[1], k: values[2], v: values[3],
+                        g: values[4], beta: values[5], state: values[0]))
+            },
+            primals: primals,
+            cotangents: [MLXArray(1.0)]
+        )
+        let (_, optimized) = vjp(
+            { values in
+                loss(
+                    gatedDeltaTrainingUpdate(
+                        q: values[1], k: values[2], v: values[3],
+                        g: values[4], beta: values[5], state: values[0]))
+            },
+            primals: primals,
+            cotangents: [MLXArray(1.0)]
+        )
+        eval(reference + optimized)
+
+        for (index, values) in zip(reference, optimized).enumerated() {
+            let maximumError = abs(values.0.asType(.float32) - values.1.asType(.float32))
+                .max().item(Float.self)
+            XCTAssertLessThan(
+                maximumError, 5e-3,
+                "Fused gated-delta training gradient \(index) diverged by \(maximumError)."
+            )
+        }
+    }
+
+    /// A realistic trace prefix must not materialize one graph node chain per token. The old
+    /// fallback crossed Metal's 499k live-resource ceiling in the end-to-end trainer.
+    func testFusedTrainingGradientHandlesLongSequence() throws {
+        MLXRandom.seed(73)
+        let q = (MLXRandom.normal([1, 4_096, 1, 32]) * MLXArray(0.01)).asType(.float32)
+        let k = (MLXRandom.normal([1, 4_096, 1, 32]) * MLXArray(0.01)).asType(.float32)
+        let v = (MLXRandom.normal([1, 4_096, 1, 2]) * MLXArray(0.01)).asType(.float32)
+        let g = MLXArray.full([1, 4_096, 1], values: MLXArray(0.99))
+        let beta = MLXArray.full([1, 4_096, 1], values: MLXArray(0.1))
+        let gradient = grad { query in
+            return gatedDeltaTrainingUpdate(
+                q: query, k: k, v: v, g: g, beta: beta
+            ).0.square().mean()
+        }(q)
+        eval(gradient)
+
+        XCTAssertEqual(gradient.shape, q.shape)
+        XCTAssertTrue(gradient.asArray(Float.self).allSatisfy(\.isFinite))
     }
 
 }

@@ -51,7 +51,9 @@ private func makeGatedDeltaKernel(hasMask: Bool, capture: Bool = false) -> MLXFa
     // ([B, T, Hv, Dv, Dk]) straight from the scan registers — a speculative-verify rollback
     // then just slices the state at the accepted index, with no re-scan. Masked steps write
     // the unchanged state, matching the re-scan semantics.
-    let captureSource = capture ? """
+    let captureSource =
+        capture
+        ? """
               {
                 auto cap = states_all + (((b_idx * T + t) * Hv + hv_idx) * Dv + dv_idx) * Dk;
                 for (int i = 0; i < n_per_t; ++i) {
@@ -153,6 +155,110 @@ private func makeGatedDeltaKernel(hasMask: Bool, capture: Bool = false) -> MLXFa
     )
 }
 
+/// Analytic reverse pass for one gated-delta chunk. The recurrent state and its reverse carrier
+/// remain in registers; only the pre-step state and G' tapes are materialized for the batched
+/// gradient expressions below. This avoids the per-token autodiff graph that exhausts Metal's
+/// resource table on realistic training contexts.
+private func makeGatedDeltaBackwardKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            constexpr int n_per_t = Dk / 32;
+
+            auto q_ = q + b_idx * T * Hv * Dk + hv_idx * Dk;
+            auto k_ = k + b_idx * T * Hv * Dk + hv_idx * Dk;
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            auto dy_ = dy + b_idx * T * Hv * Dv + hv_idx * Dv;
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto d_sout_ = d_sout + (n * Dv + dv_idx) * Dk;
+            auto d_sin_ = d_sin + (n * Dv + dv_idx) * Dk;
+            auto sp_ = sprev_tape + ((b_idx * T * Hv + hv_idx) * Dv + dv_idx) * Dk;
+            auto gp_ = gp_tape + ((b_idx * T * Hv + hv_idx) * Dv + dv_idx) * Dk;
+
+            float st[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              st[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+            }
+
+            // Pass 1: reproduce the forward recurrence and retain only pre-step states.
+            for (int t = 0; t < T; ++t) {
+              for (int i = 0; i < n_per_t; ++i) {
+                sp_[n_per_t * dk_idx + i] = st[i];
+              }
+              float kv_mem = 0.0f;
+              float tmp[n_per_t];
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                tmp[i] = st[i] * g_[hv_idx];
+                kv_mem += tmp[i] * k_[s_idx];
+              }
+              kv_mem = simd_sum(kv_mem);
+              auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * beta_[hv_idx];
+              for (int i = 0; i < n_per_t; ++i) {
+                st[i] = tmp[i] + k_[n_per_t * dk_idx + i] * delta;
+              }
+              q_ += Hv * Dk;
+              k_ += Hv * Dk;
+              v_ += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+              sp_ += Hv * Dv * Dk;
+            }
+
+            // Pass 2: run the reverse-time state carrier and retain G' for batched gradients.
+            float c[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              c[i] = static_cast<float>(d_sout_[n_per_t * dk_idx + i]);
+            }
+            auto qr = q + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+            auto kr = k + (b_idx * T + (T - 1)) * Hv * Dk + hv_idx * Dk;
+            auto dyr = dy + (b_idx * T + (T - 1)) * Hv * Dv + hv_idx * Dv;
+            auto gr = g + (b_idx * T + (T - 1)) * Hv;
+            auto br = beta + (b_idx * T + (T - 1)) * Hv;
+            gp_ += (T - 1) * Hv * Dv * Dk;
+            for (int t = T - 1; t >= 0; --t) {
+              float dyv = static_cast<float>(dyr[dv_idx]);
+              float gp[n_per_t];
+              float u = 0.0f;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                gp[i] = c[i] + dyv * static_cast<float>(qr[s_idx]);
+                u += gp[i] * static_cast<float>(kr[s_idx]);
+              }
+              u = simd_sum(u);
+              float dm = -br[hv_idx] * u;
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                gp_[s_idx] = gp[i];
+                c[i] = gr[hv_idx] * (gp[i] + dm * static_cast<float>(kr[s_idx]));
+              }
+              qr -= Hv * Dk;
+              kr -= Hv * Dk;
+              dyr -= Hv * Dv;
+              gr -= Hv;
+              br -= Hv;
+              gp_ -= Hv * Dv * Dk;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              d_sin_[n_per_t * dk_idx + i] = c[i];
+            }
+        """
+
+    return MLXFast.metalKernel(
+        name: "gated_delta_training_backward",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "dy", "d_sout", "T"],
+        outputNames: ["sprev_tape", "gp_tape", "d_sin"],
+        source: source
+    )
+}
+
 private final class GatedDeltaKernelManager: Sendable {
     static let shared = GatedDeltaKernelManager()
 
@@ -160,12 +266,14 @@ private final class GatedDeltaKernelManager: Sendable {
     let kernelMasked: MLXFast.MLXFastKernel?
     let kernelCapture: MLXFast.MLXFastKernel?
     let kernelMaskedCapture: MLXFast.MLXFastKernel?
+    let trainingBackwardKernel: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
         kernelCapture = makeGatedDeltaKernel(hasMask: false, capture: true)
         kernelMaskedCapture = makeGatedDeltaKernel(hasMask: true, capture: true)
+        trainingBackwardKernel = makeGatedDeltaBackwardKernel()
     }
 }
 
@@ -373,6 +481,158 @@ func gatedDeltaOps(
     return (y, state)
 }
 
+// MARK: - Differentiable training kernel
+
+private let gatedDeltaTrainingChunkSize = 32
+
+nonisolated(unsafe) private let _gatedDeltaTrainingChunk = CustomFunction {
+    Forward { values in
+        let result = gatedDeltaKernel(
+            q: values[1], k: values[2], v: values[3],
+            g: values[4], beta: values[5], state: values[0])
+        return [result.0, result.1]
+    }
+    VJP { primals, cotangents in
+        gatedDeltaTrainingVJP(primals: primals, cotangents: cotangents)
+    }
+}
+
+/// A chunked custom-VJP scan for gradient-bearing Qwen work. Forward uses the same fused Metal
+/// recurrence as inference. Backward uses one analytic recurrent kernel plus batched tensor ops,
+/// so graph size scales with chunks rather than individual tokens.
+func gatedDeltaTrainingUpdate(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    var running = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if running.dtype != .float32 {
+        running = running.asType(.float32)
+    }
+
+    guard GatedDeltaKernelManager.shared.kernel != nil,
+        GatedDeltaKernelManager.shared.trainingBackwardKernel != nil
+    else {
+        return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: running)
+    }
+
+    var outputs: [MLXArray] = []
+    outputs.reserveCapacity((T + gatedDeltaTrainingChunkSize - 1) / gatedDeltaTrainingChunkSize)
+    for start in stride(from: 0, to: T, by: gatedDeltaTrainingChunkSize) {
+        let end = min(start + gatedDeltaTrainingChunkSize, T)
+        let chunk = _gatedDeltaTrainingChunk([
+            running,
+            q[0..., start ..< end],
+            k[0..., start ..< end],
+            v[0..., start ..< end],
+            g[0..., start ..< end],
+            beta[0..., start ..< end],
+        ])
+        outputs.append(chunk[0])
+        running = chunk[1]
+    }
+    return (concatenated(outputs, axis: 1), running)
+}
+
+private func gatedDeltaTrainingVJP(
+    primals: [MLXArray],
+    cotangents: [MLXArray]
+) -> [MLXArray] {
+    precondition(primals.count == 6 && cotangents.count == 2)
+    let state = primals[0]
+    let q = primals[1]
+    let k = primals[2]
+    let v = primals[3]
+    let g = primals[4]
+    let beta = primals[5]
+    let dy = cotangents[0]
+    let dStateOut = cotangents[1]
+
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Hk = q.dim(2)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let repeatFactor = Hv / Hk
+    let qExpanded = (repeatFactor > 1 ? repeated(q, count: repeatFactor, axis: -2) : q)
+        .asType(.float32)
+    let kExpanded = (repeatFactor > 1 ? repeated(k, count: repeatFactor, axis: -2) : k)
+        .asType(.float32)
+    let vFloat = v.asType(.float32)
+    let gFloat = g.asType(.float32)
+    let betaFloat = beta.asType(.float32)
+
+    guard let kernel = GatedDeltaKernelManager.shared.trainingBackwardKernel else {
+        preconditionFailure("Differentiable gated-delta kernel became unavailable")
+    }
+    let tapes = kernel(
+        [
+            qExpanded, kExpanded, vFloat, gFloat, betaFloat, state.asType(.float32),
+            dy.asType(.float32), dStateOut.asType(.float32), MLXArray(T),
+        ],
+        template: [
+            ("InT", qExpanded.dtype),
+            ("StT", DType.float32),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [
+            [B, T, Hv, Dv, Dk],
+            [B, T, Hv, Dv, Dk],
+            [B, Hv, Dv, Dk],
+        ],
+        outputDTypes: [.float32, .float32, .float32]
+    )
+    let statePrevious = tapes[0]
+    let gExpanded = expandedDimensions(gFloat, axes: [-1, -2])
+    let betaExpanded = expandedDimensions(betaFloat, axis: -1)
+    let kRows = expandedDimensions(kExpanded, axis: -2)
+    let stateTilde = gExpanded * statePrevious
+    let memory = (stateTilde * kRows).sum(axis: -1)
+    let delta = betaExpanded * (vFloat - memory)
+    let statePrime = stateTilde + expandedDimensions(delta, axis: -1) * kRows
+    var dQuery = (expandedDimensions(dy.asType(.float32), axis: -1) * statePrime)
+        .sum(axis: -2)
+
+    let gPrime = tapes[1]
+    let u = (gPrime * kRows).sum(axis: -1)
+    let dMemory = -betaExpanded * u
+    let dValue = betaExpanded * u
+    let dBeta = (u * (vFloat - memory)).sum(axis: -1)
+    var dKey =
+        (gPrime * expandedDimensions(delta, axis: -1)).sum(axis: -2)
+        + (stateTilde * expandedDimensions(dMemory, axis: -1)).sum(axis: -2)
+    let dStateTilde = gPrime + expandedDimensions(dMemory, axis: -1) * kRows
+    let dGate = (dStateTilde * statePrevious).sum(axes: [-1, -2])
+
+    if repeatFactor > 1 {
+        dQuery = dQuery.reshaped(B, T, Hk, repeatFactor, Dk).sum(axis: 3)
+        dKey = dKey.reshaped(B, T, Hk, repeatFactor, Dk).sum(axis: 3)
+    }
+    let dState = depends(
+        input: tapes[2], dependencies: [dQuery, dKey, dValue, dGate, dBeta])
+    return [
+        dState.asType(state.dtype),
+        dQuery.asType(q.dtype),
+        dKey.asType(k.dtype),
+        dValue.asType(v.dtype),
+        dGate.asType(g.dtype),
+        dBeta.asType(beta.dtype),
+    ]
+}
+
 // MARK: - Public API
 
 public func gatedDeltaUpdate(
@@ -405,6 +665,10 @@ public func gatedDeltaUpdate(
         GatedDeltaKernelManager.shared.kernel != nil
     {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+
+    if GatedDeltaExecutionContext.requiresDifferentiableOperations, mask == nil {
+        return gatedDeltaTrainingUpdate(q: q, k: k, v: v, g: g, beta: beta, state: state)
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
