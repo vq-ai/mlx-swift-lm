@@ -40,7 +40,12 @@ private let _computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLX
     }
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    _computeGatedDeltaG(aLog, a, dtBias)
+    if GatedDeltaExecutionContext.requiresDifferentiableOperations {
+        // `compile` lowers this elementwise chain to a CustomKernel. That is ideal for decode,
+        // but CustomKernel has no VJP; retain the transparent graph for adapter training.
+        return exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+    }
+    return _computeGatedDeltaG(aLog, a, dtBias)
 }
 
 // MARK: - Metal Kernel

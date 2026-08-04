@@ -271,8 +271,19 @@ final class Qwen35GatedDeltaNet: Module {
         var state = cache?[1]
         let dtype = q.dtype
         let invScale = pow(Float(headKDim), -0.5)
-        let qNormed = _rmsNormScaled(q, MLXArray(pow(invScale, 2)).asType(dtype))
-        let kNormed = _rmsNormScaled(k, MLXArray(invScale).asType(dtype))
+        let qScale = MLXArray(pow(invScale, 2)).asType(dtype)
+        let kScale = MLXArray(invScale).asType(dtype)
+        let qNormed: MLXArray
+        let kNormed: MLXArray
+        if Qwen35TrainingExecutionContext.configuration != nil {
+            // The compiled helper is an inference CustomKernel with no VJP. RMSNorm itself is
+            // differentiable, so keep the same math as transparent operations while training.
+            qNormed = qScale * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            kNormed = kScale * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        } else {
+            qNormed = _rmsNormScaled(q, qScale)
+            kNormed = _rmsNormScaled(k, kScale)
+        }
 
         var out: MLXArray
 
@@ -422,16 +433,34 @@ final class Qwen35Attention: Module {
         queries = applyRotaryPosition(rope, to: queries, offset: offset)
         keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let attentionOutput: MLXArray
+        if cache == nil,
+            let training = Qwen35TrainingExecutionContext.configuration,
+            L >= training.minimumChunkedAttentionTokens
+        {
+            let causal: Bool
+            switch mask {
+            case .causal:
+                causal = true
+            case .none:
+                causal = false
+            case .array, .arrays:
+                preconditionFailure("Long-context Qwen training requires a causal or empty mask")
+            }
+            attentionOutput = qwen35MemoryEfficientAttention(
+                queries: queries, keys: keys, values: values, scale: scale,
+                causal: causal, queryChunkSize: training.attentionQueryChunkSize)
+        } else {
+            attentionOutput = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
+        let output = attentionOutput.transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -535,6 +564,46 @@ final class Qwen35DecoderLayer: Module {
     }
 
     func callAsFunction(
+        _ x: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?
+    ) -> MLXArray {
+        guard cache == nil,
+            let trainingConfiguration = Qwen35TrainingExecutionContext.configuration,
+            trainingConfiguration.gradientCheckpointing
+        else {
+            return callWithoutCheckpoint(
+                x, attentionMask: attentionMask, ssmMask: ssmMask, cache: cache)
+        }
+        let flattened = trainableParameters().flattened()
+        let names = flattened.map(\.0)
+        let parameterCount = names.count
+        let inputs = flattened.map(\.1) + [x]
+        return qwen35GatedCheckpoint(inputs) { arrays in
+            // MLX invokes a custom VJP's recompute callback outside Swift task-local state.
+            // Re-enter both scopes explicitly so nested attention and gated-delta operations
+            // keep their differentiable implementations during the checkpoint backward.
+            Qwen35TrainingExecutionContext.withMemoryEfficientOperations(
+                configuration: trainingConfiguration
+            ) {
+                GatedDeltaExecutionContext.withDifferentiableOperations {
+                    if parameterCount > 0 {
+                        self.update(
+                            parameters: ModuleParameters.unflattened(
+                                zip(names, arrays.prefix(parameterCount)).map { ($0.0, $0.1) }))
+                    }
+                    return [
+                        self.callWithoutCheckpoint(
+                            arrays[parameterCount], attentionMask: attentionMask,
+                            ssmMask: ssmMask, cache: nil)
+                    ]
+                }
+            }
+        }[0]
+    }
+
+    private func callWithoutCheckpoint(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
